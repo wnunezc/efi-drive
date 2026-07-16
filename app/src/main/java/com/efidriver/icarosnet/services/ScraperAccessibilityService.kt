@@ -6,16 +6,15 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
-import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
-import android.graphics.drawable.GradientDrawable
 import com.efidriver.icarosnet.models.Trip
 import com.efidriver.icarosnet.engine.ProfitabilityEngine
 import com.efidriver.icarosnet.models.TripStatus
@@ -26,7 +25,8 @@ class ScraperAccessibilityService : AccessibilityService() {
 
     private lateinit var settingsManager: SettingsManager
     private lateinit var windowManager: WindowManager
-    private val TAG = "EfiDebug"
+    private val TAG_HUD = "EfiHUD"
+    private val TAG_SONDA = "EfiSonda"
     
     private val activeOverlays = mutableMapOf<String, OverlayRecord>()
 
@@ -40,21 +40,33 @@ class ScraperAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         settingsManager = SettingsManager(this)
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        Log.d(TAG, "--- MONITOR v5.5 (HUD COMPLETO) ---")
+        Log.d(TAG_HUD, "--- SERVICIO ESTABLE v7.2 - HUD PROTEGIDO ---")
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val packageName = event?.packageName?.toString() ?: ""
+        
         if (packageName == "sinet.startup.inDriver") {
-            processAndIntervene()
-        } else if (event?.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-            if (packageName != "com.efidriver.icarosnet") {
-                clearAllOverlays()
+            // 1. HUD Y FILTRO (Producci??n)
+            processMainFlow()
+            
+            // 2. DIAGN??STICO ESTRUCTURAL (Aislado)
+            if (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED || 
+                event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                try {
+                    ejecutarSondaEstructural()
+                } catch (e: Exception) {}
+            }
+        } else {
+            if (event?.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                if (packageName != "com.efidriver.icarosnet") {
+                    clearAllOverlays()
+                }
             }
         }
     }
 
-    private fun processAndIntervene() {
+    private fun processMainFlow() {
         if (!::settingsManager.isInitialized) return
         val rootNode = rootInActiveWindow ?: return
         
@@ -91,6 +103,47 @@ class ScraperAccessibilityService : AccessibilityService() {
         keysToRemove.forEach { removeOverlay(it) }
     }
 
+    // SONDA AGNOSTICA: No busca valores, busca ESTRUCTURA
+    private fun ejecutarSondaEstructural() {
+        val root = rootInActiveWindow ?: return
+        
+        // Buscamos cualquier nodo cuyo ID termine en _PointB (el ancla de destino)
+        recorrerNodosPorEstructura(root)
+    }
+
+    private fun recorrerNodosPorEstructura(node: AccessibilityNodeInfo?) {
+        if (node == null) return
+        
+        val viewId = node.viewIdResourceName ?: ""
+        
+        // Si encontramos el ancla estructural del destino
+        if (viewId.endsWith("_PointB")) {
+            Log.e(TAG_SONDA, "ANCLA DETECTADA: $viewId")
+            
+            // Inspeccionamos al PADRE para ver a sus HERMANOS (donde suele estar el globo de texto)
+            val parent = node.parent
+            if (parent != null) {
+                Log.e(TAG_SONDA, "Inspeccionando entorno del Punto B (Hermanos: \${parent.childCount})")
+                for (i in 0 until parent.childCount) {
+                    val sibling = parent.getChild(i)
+                    if (sibling != null) {
+                        val sText = sibling.text?.toString() ?: "NoText"
+                        val sDesc = sibling.contentDescription?.toString() ?: "NoDesc"
+                        Log.e(TAG_SONDA, "  DATO ENTORNO -> Txt: '\$sText' | Desc: '\$sDesc' | Class: \${sibling.className}")
+                        sibling.recycle()
+                    }
+                }
+                parent.recycle()
+            }
+        }
+
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i)
+            recorrerNodosPorEstructura(child)
+            child?.recycle()
+        }
+    }
+
     private fun syncOverlay(tripKey: String, bounds: Rect, result: ProfitabilityResult) {
         val overlayWidth = (bounds.width() * 0.4).toInt()
         val params = WindowManager.LayoutParams(
@@ -120,9 +173,8 @@ class ScraperAccessibilityService : AccessibilityService() {
                 val container = LinearLayout(this).apply {
                     orientation = LinearLayout.VERTICAL
                     gravity = Gravity.CENTER
-                    setBackgroundColor(Color.parseColor("#E6004D00")) // Verde m??s oscuro y s??lido
+                    setBackgroundColor(Color.parseColor("#E6004D00"))
                 }
-                
                 updateHUDText(container, result)
                 windowManager.addView(container, params)
                 activeOverlays[tripKey] = OverlayRecord(container, container, Rect(bounds))
@@ -132,8 +184,6 @@ class ScraperAccessibilityService : AccessibilityService() {
 
     private fun updateHUDText(container: LinearLayout, result: ProfitabilityResult) {
         container.removeAllViews()
-        
-        // 1. RENTABLE (Cabecera)
         container.addView(TextView(this).apply {
             text = "RENTABLE"
             setTextColor(Color.WHITE)
@@ -141,16 +191,12 @@ class ScraperAccessibilityService : AccessibilityService() {
             gravity = Gravity.CENTER
             setTypeface(null, Typeface.BOLD)
         })
-
-        // 2. [X.XX] $/km
         container.addView(TextView(this).apply {
             text = String.format("%.2f", result.expectedUsdPerKm) + " $/km"
             setTextColor(Color.WHITE)
             textSize = 12f
             gravity = Gravity.CENTER
         })
-
-        // 3. Gana: $Y.YY
         container.addView(TextView(this).apply {
             text = "Gana: $" + String.format("%.2f", result.trueProfit)
             setTextColor(Color.WHITE)
@@ -158,19 +204,15 @@ class ScraperAccessibilityService : AccessibilityService() {
             gravity = Gravity.CENTER
         })
 
-        // 4. Recogida y Total con el indicador Naranja de Preview
         val footerContainer = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
         }
-
         footerContainer.addView(TextView(this).apply {
             text = String.format("%.1f", result.pickupDistanceKm) + " km | "
             setTextColor(Color.WHITE)
             textSize = 10f
         })
-
-        // El círculo naranja [ ]
         val orangeCircle = View(this).apply {
             val size = (10 * resources.displayMetrics.density).toInt()
             layoutParams = LinearLayout.LayoutParams(size, size).apply {
@@ -178,17 +220,15 @@ class ScraperAccessibilityService : AccessibilityService() {
             }
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
-                setColor(Color.parseColor("#FFA500")) // Naranja
+                setColor(Color.parseColor("#FFA500"))
             }
         }
         footerContainer.addView(orangeCircle)
-
         footerContainer.addView(TextView(this).apply {
             text = "Total: " + String.format("%.1f", result.totalDistanceKm) + "? km"
             setTextColor(Color.WHITE)
             textSize = 10f
         })
-
         container.addView(footerContainer)
     }
 
@@ -200,7 +240,14 @@ class ScraperAccessibilityService : AccessibilityService() {
     }
 
     private fun clearAllOverlays() {
-        activeOverlays.keys.toList().forEach { removeOverlay(it) }
+        val iterator = activeOverlays.entries.iterator()
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            try {
+                windowManager.removeView(entry.value.view)
+            } catch (e: Exception) {}
+            iterator.remove()
+        }
     }
 
     private fun executeDirectHide(node: AccessibilityNodeInfo) {
