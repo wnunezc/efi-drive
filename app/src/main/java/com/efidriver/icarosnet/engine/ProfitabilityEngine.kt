@@ -6,42 +6,33 @@ import kotlin.math.round
 
 object ProfitabilityEngine {
 
-    /**
-     * Calcula la rentabilidad de un viaje basado en los parámetros de entrada.
-     * Implementación exacta del algoritmo de rentabilidad solicitado.
-     */
     fun calculate(
         tripPrice: Double,
         pickupDistanceKm: Double,
-        tripDistanceKm: Double = 1.0, // Valor por defecto sugerido para cálculo previo
+        tripDistanceKm: Double = 1.0, 
         maxPickupDistanceKm: Double,
         minUsdPerKm: Double,
         commissionPercent: Double
     ): ProfitabilityResult {
         
-        // Paso 1: Calcular ingreso real
+        // 1. Neto tras comisión
         val expectedIncome = tripPrice * (1.0 - (commissionPercent / 100.0))
         
-        // Paso 3: Calcular distancia total (Lo movemos arriba para tenerlo siempre)
+        // 2. Distancia Total
         val totalDistanceKm = pickupDistanceKm + tripDistanceKm
         
-        // Paso 4: Calcular ingreso por kilómetro (Evitar división por cero)
-        val rawUsdPerKm = if (totalDistanceKm > 0) {
-            expectedIncome / totalDistanceKm
-        } else {
-            0.0
-        }
-        
-        // Redondear a 2 decimales para evitar decimales infinitos y comparaciones erróneas
+        // 3. Rentabilidad $/km
+        val rawUsdPerKm = if (totalDistanceKm > 0) expectedIncome / totalDistanceKm else 0.0
         val expectedUsdPerKm = round(rawUsdPerKm * 100.0) / 100.0
         
-        // Paso 2: Evaluar recogida (Regla de Oro)
-        val pickupAccepted = pickupDistanceKm <= maxPickupDistanceKm
+        // 4. GANANCIA REAL (Neto - (Distancia * Umbral))
+        val operatingCost = totalDistanceKm * minUsdPerKm
+        val trueProfit = round((expectedIncome - operatingCost) * 100.0) / 100.0
         
-        // Paso 5: Determinar rentabilidad final por precio
+        // 5. Verificación de Filtros
+        val pickupAccepted = pickupDistanceKm <= maxPickupDistanceKm
         val tripAcceptedByPrice = expectedUsdPerKm >= minUsdPerKm
         
-        // Determinación del estado final
         val status = when {
             !pickupAccepted -> TripStatus.NOT_RENTABLE_PICKUP
             !tripAcceptedByPrice -> TripStatus.NOT_RENTABLE
@@ -53,6 +44,9 @@ object ProfitabilityEngine {
             expectedIncome = expectedIncome,
             expectedUsdPerKm = expectedUsdPerKm,
             totalDistanceKm = totalDistanceKm,
+            trueProfit = trueProfit,
+            pickupDistanceKm = pickupDistanceKm,
+            isPreview = true, // Siempre true en esta fase de lista de viajes
             pickupAccepted = pickupAccepted,
             tripAccepted = (status == TripStatus.RENTABLE)
         )

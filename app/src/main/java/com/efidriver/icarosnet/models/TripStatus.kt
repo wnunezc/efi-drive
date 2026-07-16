@@ -8,9 +8,12 @@ enum class TripStatus {
 
 data class ProfitabilityResult(
     val status: TripStatus,
-    val expectedIncome: Double,
-    val expectedUsdPerKm: Double,
-    val totalDistanceKm: Double,
+    val expectedIncome: Double,     // Neto tras comisión
+    val expectedUsdPerKm: Double,   // Rentabilidad $/km
+    val totalDistanceKm: Double,    // Distancia estimada
+    val trueProfit: Double,         // GANANCIA REAL (Neto - Costo base)
+    val pickupDistanceKm: Double,   // Distancia de recogida real
+    val isPreview: Boolean,         // FLAG: Indica si es cálculo basado en lista (estimado)
     val pickupAccepted: Boolean,
     val tripAccepted: Boolean
 )
