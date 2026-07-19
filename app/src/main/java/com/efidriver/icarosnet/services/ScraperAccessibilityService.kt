@@ -1,12 +1,16 @@
 package com.efidriver.icarosnet.services
 
 import android.accessibilityservice.AccessibilityService
+import android.annotation.SuppressLint
+import android.graphics.Bitmap
 import android.content.Context
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.Gravity
 import android.view.View
@@ -15,20 +19,71 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.LinearLayout
 import android.widget.TextView
+import com.efidriver.icarosnet.vision.RouteLabelDetector
+import com.efidriver.icarosnet.vision.RouteLabelOcr
 import com.efidriver.icarosnet.models.Trip
 import com.efidriver.icarosnet.engine.ProfitabilityEngine
 import com.efidriver.icarosnet.models.TripStatus
 import com.efidriver.icarosnet.models.ProfitabilityResult
 import com.efidriver.icarosnet.engine.SettingsManager
+import java.util.concurrent.Executors
 
+@SuppressLint("AccessibilityPolicy")
 class ScraperAccessibilityService : AccessibilityService() {
 
     private lateinit var settingsManager: SettingsManager
     private lateinit var windowManager: WindowManager
     private val TAG_HUD = "EfiHUD"
     private val TAG_SONDA = "EfiSonda"
+    private val TAG_FLOW = "EfiTripFlow"
+    private val screenshotExecutor = Executors.newSingleThreadExecutor()
+    private val mainHandler = Handler(Looper.getMainLooper())
     
     private val activeOverlays = mutableMapOf<String, OverlayRecord>()
+
+    private enum class DetailFlowStage {
+        IDLE,
+        CARD_CLICKED,
+        MODAL_RENDERED,
+        DETAIL_CONTENT_CHANGED,
+        MAP_CHANGED,
+        OCR_REQUESTED,
+        OCR_COMPLETED
+    }
+
+    private data class PendingTripClick(
+        val passengerName: String,
+        val pickupDistanceText: String,
+        val priceText: String,
+        val pickupAddress: String,
+        val destinationAddress: String
+    ) {
+        val fingerprint: String = listOf(passengerName, priceText, pickupAddress, destinationAddress)
+            .joinToString("|")
+            .replace("\\s".toRegex(), "")
+    }
+
+    private data class TripFlowContext(
+        val attemptId: Long,
+        val trip: PendingTripClick
+    ) {
+        val fingerprint: String
+            get() = trip.fingerprint
+    }
+
+    private var detailFlowStage = DetailFlowStage.IDLE
+    private var pendingTripClick: PendingTripClick? = null
+    private var activeFlowContext: TripFlowContext? = null
+    private var screenshotInFlight = false
+    private var detailFlowAttempt = 0L
+    private var lastFlowEventSummary = "none"
+    private var lastScreenshotReason = "none"
+    private var lastModalSummary = "none"
+    private var lastRouteScanSummary = "none"
+    private var lastOcrSummary = "none"
+    private var routeLabelMonitorActive = false
+    private var routeLabelScanCount = 0
+    private var overlayClearGeneration = 0L
 
     private data class OverlayRecord(
         val view: View,
@@ -47,12 +102,18 @@ class ScraperAccessibilityService : AccessibilityService() {
         val packageName = event?.packageName?.toString() ?: ""
         
         if (packageName == "sinet.startup.inDriver") {
+            observeTripDetailFlow(event)
+
             // 1. HUD Y FILTRO (Producci??n)
-            processMainFlow()
+            if (isTripDetailFlowActive()) {
+                clearAllOverlays()
+            } else {
+                processMainFlow()
+            }
             
             // 2. DIAGN??STICO ESTRUCTURAL (Aislado)
-            if (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED || 
-                event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            if (event?.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
+                event?.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
                 try {
                     ejecutarSondaEstructural()
                 } catch (e: Exception) {}
@@ -60,10 +121,449 @@ class ScraperAccessibilityService : AccessibilityService() {
         } else {
             if (event?.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
                 if (packageName != "com.efidriver.icarosnet") {
+                    resetTripDetailFlow("external_package=$packageName")
                     clearAllOverlays()
                 }
             }
         }
+    }
+
+    private fun observeTripDetailFlow(event: AccessibilityEvent?) {
+        if (event == null) return
+        lastFlowEventSummary = describeFlowEvent(event)
+
+        when (event.eventType) {
+            AccessibilityEvent.TYPE_VIEW_CLICKED -> {
+                val tripClick = extractClickedTrip(event) ?: return
+                if (detailFlowStage != DetailFlowStage.IDLE && detailFlowStage != DetailFlowStage.MAP_CHANGED) {
+                    logFlowIncomplete("new_trip_clicked_before_completion")
+                }
+                detailFlowAttempt += 1
+                pendingTripClick = tripClick
+                activeFlowContext = TripFlowContext(detailFlowAttempt, tripClick)
+                detailFlowStage = DetailFlowStage.CARD_CLICKED
+                clearAllOverlays()
+                lastScreenshotReason = "none"
+                lastModalSummary = "none"
+                lastRouteScanSummary = "none"
+                lastOcrSummary = "none"
+                routeLabelScanCount = 0
+                Log.d(
+                    TAG_FLOW,
+                    "CARD_CLICKED attempt=$detailFlowAttempt fp=${tripClick.fingerprint} " +
+                        "name=${tripClick.passengerName} pickup=${tripClick.pickupDistanceText} " +
+                        "price=${tripClick.priceText} from=${tripClick.pickupAddress} " +
+                        "to=${tripClick.destinationAddress}"
+                )
+            }
+
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
+            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
+                if (detailFlowStage == DetailFlowStage.CARD_CLICKED && isTripDetailWindowEvent(event)) {
+                    detailFlowStage = DetailFlowStage.MODAL_RENDERED
+                    Log.d(
+                        TAG_FLOW,
+                        "MODAL_RENDERED_BY_WINDOW ${flowContextLog()} " +
+                            "eventClass=${event.className}"
+                    )
+                    startRouteLabelMonitor("modal_window_event")
+                }
+
+                if (
+                    (detailFlowStage == DetailFlowStage.CARD_CLICKED || detailFlowStage == DetailFlowStage.MODAL_RENDERED) &&
+                    isGoogleMapEvent(event)
+                ) {
+                    detailFlowStage = DetailFlowStage.MAP_CHANGED
+                    Log.d(
+                        TAG_FLOW,
+                        "MAP_CHANGED_BY_EVENT ${flowContextLog()} " +
+                            "eventClass=${event.className} desc=${event.contentDescription}"
+                    )
+                }
+
+                val rootNode = rootInActiveWindow
+                if (rootNode == null) {
+                    if (detailFlowStage != DetailFlowStage.IDLE && detailFlowStage != DetailFlowStage.MAP_CHANGED) {
+                        logFlowWaiting("root_unavailable")
+                    }
+                    return
+                }
+
+                if (detailFlowStage != DetailFlowStage.IDLE && isTripListVisible(rootNode) && !isTripDetailModalVisible(rootNode)) {
+                    resetTripDetailFlow("trip_list_visible_without_modal")
+                    return
+                }
+
+                if (detailFlowStage == DetailFlowStage.CARD_CLICKED && isTripDetailModalVisible(rootNode)) {
+                    val modalTrip = extractModalTrip(rootNode)
+                    lastModalSummary = "visible=true modal=${modalTrip?.fingerprint ?: "unknown"} " +
+                        "matches=${modalTrip?.fingerprint == pendingTripClick?.fingerprint}"
+                    detailFlowStage = DetailFlowStage.MODAL_RENDERED
+                    Log.d(
+                        TAG_FLOW,
+                        "MODAL_RENDERED ${flowContextLog()} " +
+                            "modal=${modalTrip?.fingerprint ?: "unknown"} " +
+                            "matches=${modalTrip?.fingerprint == pendingTripClick?.fingerprint}"
+                        )
+                    if (modalTrip != null && modalTrip.fingerprint != pendingTripClick?.fingerprint) {
+                        logFlowWaiting("modal_trip_fingerprint_mismatch modal=${modalTrip.fingerprint}")
+                    }
+                    startRouteLabelMonitor("modal_tree_confirmed")
+                }
+
+                if (
+                    detailFlowStage == DetailFlowStage.MODAL_RENDERED &&
+                    event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED &&
+                    isTripDetailModalVisible(rootNode)
+                ) {
+                    detailFlowStage = DetailFlowStage.DETAIL_CONTENT_CHANGED
+                    Log.d(
+                        TAG_FLOW,
+                        "DETAIL_CONTENT_CHANGED ${flowContextLog()} " +
+                            "eventClass=${event.className} modalVisible=true"
+                    )
+                    startRouteLabelMonitor("detail_content_changed")
+                }
+
+                if (
+                    (detailFlowStage == DetailFlowStage.MODAL_RENDERED || detailFlowStage == DetailFlowStage.DETAIL_CONTENT_CHANGED) &&
+                    isGoogleMapEvent(event) &&
+                    isTripDetailModalVisible(rootNode)
+                ) {
+                    detailFlowStage = DetailFlowStage.MAP_CHANGED
+                    Log.d(
+                        TAG_FLOW,
+                        "MAP_CHANGED ${flowContextLog()} " +
+                            "eventClass=${event.className} desc=${event.contentDescription}"
+                    )
+                }
+            }
+        }
+    }
+
+    private fun isTripDetailWindowEvent(event: AccessibilityEvent): Boolean {
+        return event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+            event.className?.toString() == "ya6"
+    }
+
+    private fun isTripDetailFlowActive(): Boolean {
+        return detailFlowStage != DetailFlowStage.IDLE
+    }
+
+    private fun isTripDetailFlowComplete(): Boolean {
+        return detailFlowStage == DetailFlowStage.MAP_CHANGED ||
+            detailFlowStage == DetailFlowStage.OCR_COMPLETED
+    }
+
+    private fun startRouteLabelMonitor(reason: String) {
+        routeLabelMonitorActive = true
+        requestRouteLabelScreenshotWhenOverlaysGone(reason, overlayClearGeneration)
+    }
+
+    private fun requestRouteLabelScreenshotWhenOverlaysGone(reason: String, requiredOverlayGeneration: Long) {
+        mainHandler.post {
+            if (!routeLabelMonitorActive) return@post
+            if (activeOverlays.isNotEmpty() || overlayClearGeneration < requiredOverlayGeneration) {
+                logFlowWaiting(
+                    "waiting_overlay_clear reason=$reason activeOverlays=${activeOverlays.size} " +
+                        "overlayGeneration=$overlayClearGeneration required=$requiredOverlayGeneration"
+                )
+                mainHandler.postDelayed({
+                    requestRouteLabelScreenshotWhenOverlaysGone(reason, requiredOverlayGeneration)
+                }, 80L)
+                return@post
+            }
+
+            mainHandler.post {
+                if (!routeLabelMonitorActive) return@post
+                requestRouteLabelScreenshot(reason)
+            }
+        }
+    }
+
+    private fun requestRouteLabelScreenshot(reason: String) {
+        if (screenshotInFlight) {
+            logFlowWaiting("screenshot_already_in_flight reason=$reason")
+            scheduleRouteLabelRescan("screenshot_in_flight")
+            return
+        }
+        screenshotInFlight = true
+        routeLabelScanCount += 1
+        lastScreenshotReason = reason
+        val context = activeFlowContext ?: pendingTripClick?.let { TripFlowContext(detailFlowAttempt, it) }
+        Log.d(TAG_FLOW, "SCREENSHOT_REQUEST ${flowContextLog(context)} scan=$routeLabelScanCount reason=$reason stage=$detailFlowStage")
+
+        try {
+            takeScreenshot(
+                android.view.Display.DEFAULT_DISPLAY,
+                screenshotExecutor,
+                object : TakeScreenshotCallback {
+                    override fun onSuccess(screenshot: ScreenshotResult) {
+                        try {
+                            val hardwareBuffer = screenshot.hardwareBuffer
+                            val bitmap = Bitmap.wrapHardwareBuffer(hardwareBuffer, screenshot.colorSpace)?.copy(Bitmap.Config.ARGB_8888, false)
+                            hardwareBuffer.close()
+
+                            if (bitmap == null) {
+                                Log.d(TAG_FLOW, "SCREENSHOT_EMPTY ${flowContextLog(context)}")
+                                logFlowIncomplete("screenshot_empty", context)
+                                return
+                            }
+
+                            val result = RouteLabelDetector.detect(bitmap)
+                            lastRouteScanSummary = "visible=${result.routeLabelsVisible} " +
+                                "bluePixels=${result.bluePixelCount} greenPixels=${result.greenPixelCount} " +
+                                "blueBox=${result.pickupLabel?.bounds ?: "none"} " +
+                                "greenBox=${result.destinationLabel?.bounds ?: "none"}"
+                            Log.d(
+                                TAG_FLOW,
+                                "ROUTE_LABEL_SCAN ${flowContextLog(context)} scan=$routeLabelScanCount " +
+                                    "afterFlowReset=${isContextStale(context)} $lastRouteScanSummary"
+                            )
+
+                            if (result.routeLabelsVisible) {
+                                if (!isContextStale(context)) {
+                                    routeLabelMonitorActive = false
+                                    detailFlowStage = DetailFlowStage.MAP_CHANGED
+                                }
+                                Log.d(TAG_FLOW, "ROUTE_LABELS_VISIBLE ${flowContextLog(context)} afterFlowReset=${isContextStale(context)}")
+                                requestRouteLabelOcr(bitmap, result, context)
+                            } else {
+                                logFlowWaiting("route_labels_not_visible_after_screenshot", context)
+                                if (!isContextStale(context)) {
+                                    scheduleRouteLabelRescan("route_labels_not_visible")
+                                }
+                            }
+                            bitmap.recycle()
+                        } catch (e: Exception) {
+                            logFlowIncomplete("screenshot_analysis_failed message=${e.message}", context)
+                            Log.e(TAG_FLOW, "SCREENSHOT_ANALYSIS_FAILED ${flowContextLog(context)} ${e.message}", e)
+                        } finally {
+                            screenshotInFlight = false
+                        }
+                    }
+
+                    override fun onFailure(errorCode: Int) {
+                        screenshotInFlight = false
+                        Log.d(TAG_FLOW, "SCREENSHOT_FAILED ${flowContextLog(context)} code=$errorCode")
+                        logFlowIncomplete("screenshot_failed code=$errorCode", context)
+                    }
+                }
+            )
+        } catch (e: SecurityException) {
+            screenshotInFlight = false
+            logFlowIncomplete("screenshot_not_allowed message=${e.message}", context)
+            Log.e(TAG_FLOW, "SCREENSHOT_NOT_ALLOWED ${e.message}", e)
+        }
+    }
+
+    private fun requestRouteLabelOcr(
+        bitmap: Bitmap,
+        detection: RouteLabelDetector.DetectionResult,
+        context: TripFlowContext?
+    ) {
+        if (!isContextStale(context)) {
+            routeLabelMonitorActive = false
+            detailFlowStage = DetailFlowStage.OCR_REQUESTED
+        }
+        Log.d(
+            TAG_FLOW,
+            "ROUTE_LABEL_OCR_REQUEST ${flowContextLog(context)} afterFlowReset=${isContextStale(context)} " +
+                "blueBox=${detection.pickupLabel?.bounds ?: "none"} greenBox=${detection.destinationLabel?.bounds ?: "none"}"
+        )
+
+        RouteLabelOcr.recognize(
+            source = bitmap,
+            detection = detection,
+            onSuccess = { result ->
+                lastOcrSummary = "complete=${result.complete} " +
+                    "pickupRaw=${result.pickup.rawText} pickupMin=${result.pickup.minutes} pickupKm=${result.pickup.distanceKm} " +
+                    "destinationRaw=${result.destination.rawText} destinationMin=${result.destination.minutes} destinationKm=${result.destination.distanceKm}"
+                Log.d(
+                    TAG_FLOW,
+                    "ROUTE_LABEL_OCR_RESULT ${flowContextLog(context)} afterFlowReset=${isContextStale(context)} $lastOcrSummary"
+                )
+
+                if (result.complete) {
+                    if (!isContextStale(context)) {
+                        detailFlowStage = DetailFlowStage.OCR_COMPLETED
+                    }
+                    Log.d(
+                        TAG_FLOW,
+                        "ROUTE_LABEL_METRICS_READY ${flowContextLog(context)} afterFlowReset=${isContextStale(context)} " +
+                            "pickupMin=${result.pickup.minutes} pickupKm=${result.pickup.distanceKm} " +
+                            "destinationMin=${result.destination.minutes} destinationKm=${result.destination.distanceKm}"
+                    )
+                } else {
+                    logFlowIncomplete("ocr_parse_incomplete", context)
+                }
+            },
+            onFailure = { exception ->
+                lastOcrSummary = "failed=${exception.message}"
+                logFlowIncomplete("ocr_failed message=${exception.message}", context)
+            }
+        )
+    }
+
+    private fun scheduleRouteLabelRescan(reason: String) {
+        if (!routeLabelMonitorActive) return
+        mainHandler.postDelayed({
+            if (!routeLabelMonitorActive) return@postDelayed
+            val rootNode = rootInActiveWindow
+            if (rootNode == null) {
+                logFlowWaiting("route_label_rescan_root_unavailable reason=$reason")
+                scheduleRouteLabelRescan("root_unavailable")
+                return@postDelayed
+            }
+
+            if (isTripListVisible(rootNode) && !hasNodeByText(rootNode, "Solicitud de viaje")) {
+                resetTripDetailFlow("trip_list_returned_before_route_labels_visible reason=$reason")
+                return@postDelayed
+            }
+
+            requestRouteLabelScreenshotWhenOverlaysGone(
+                "visual_rescan_after_$reason",
+                overlayClearGeneration
+            )
+        }, 250L)
+    }
+
+    private fun extractClickedTrip(event: AccessibilityEvent): PendingTripClick? {
+        val texts = event.text.map { it.toString().trim() }.filter { it.isNotEmpty() }
+        val joined = texts.joinToString("|")
+        if (!joined.contains("$")) return null
+        if (!joined.contains("Seleccionar en el mapa", ignoreCase = true)) return null
+
+        val passengerName = texts.firstOrNull() ?: return null
+        val pickupDistanceText = texts.firstOrNull { it.contains("km", ignoreCase = true) || it.contains("metro", ignoreCase = true) } ?: return null
+        val priceText = texts.firstOrNull { it.contains("$") } ?: return null
+        val priceIndex = texts.indexOf(priceText)
+        val pickupAddress = texts.drop(priceIndex + 1).firstOrNull {
+            !it.equals("Precio justo", ignoreCase = true) &&
+                !it.equals("Yappy", ignoreCase = true) &&
+                !it.equals("Quejarse", ignoreCase = true) &&
+                !it.equals("Ocultar", ignoreCase = true) &&
+                !it.equals("Seleccionar en el mapa", ignoreCase = true)
+        } ?: return null
+        val pickupIndex = texts.indexOf(pickupAddress)
+        val destinationAddress = texts.drop(pickupIndex + 1).firstOrNull {
+            !it.equals("Yappy", ignoreCase = true) &&
+                !it.equals("Quejarse", ignoreCase = true) &&
+                !it.equals("Ocultar", ignoreCase = true) &&
+                !it.equals("Seleccionar en el mapa", ignoreCase = true)
+        } ?: return null
+
+        return PendingTripClick(
+            passengerName = passengerName,
+            pickupDistanceText = pickupDistanceText,
+            priceText = priceText,
+            pickupAddress = pickupAddress,
+            destinationAddress = destinationAddress
+        )
+    }
+
+    private fun extractModalTrip(rootNode: AccessibilityNodeInfo): PendingTripClick? {
+        val passengerName = findTextById(rootNode, "sinet.startup.inDriver:id/user_info_text_name") ?: return null
+        val pickupDistanceText = findTextById(rootNode, "sinet.startup.inDriver:id/order_info_header_text_distance") ?: return null
+        val priceText = findTextById(rootNode, "sinet.startup.inDriver:id/order_info_header_text_price") ?: return null
+        val pickupAddress = findTextById(rootNode, "sinet.startup.inDriver:id/order_info_address_text_pickup") ?: return null
+        val destinationAddress = findTextById(rootNode, "sinet.startup.inDriver:id/order_info_address_text_destination") ?: return null
+
+        return PendingTripClick(
+            passengerName = passengerName,
+            pickupDistanceText = pickupDistanceText,
+            priceText = priceText,
+            pickupAddress = pickupAddress,
+            destinationAddress = destinationAddress
+        )
+    }
+
+    private fun isTripDetailModalVisible(rootNode: AccessibilityNodeInfo): Boolean {
+        return hasNodeById(rootNode, "sinet.startup.inDriver:id/design_bottom_sheet") &&
+            hasNodeById(rootNode, "sinet.startup.inDriver:id/button_offer") &&
+            hasNodeById(rootNode, "sinet.startup.inDriver:id/order_info_header_text_price") &&
+            (
+                hasNodeById(rootNode, "sinet.startup.inDriver:id/order_info_header_text_distance") ||
+                    hasNodeByText(rootNode, "Solicitud de viaje")
+                )
+    }
+
+    private fun isTripListVisible(rootNode: AccessibilityNodeInfo): Boolean {
+        return rootNode.findAccessibilityNodeInfosByViewId("sinet.startup.inDriver:id/item_order_container").isNotEmpty()
+    }
+
+    private fun isGoogleMapEvent(event: AccessibilityEvent): Boolean {
+        return event.className?.toString() == "android.view.TextureView" &&
+            event.contentDescription?.toString()?.contains("Mapa de Google", ignoreCase = true) == true
+    }
+
+    private fun findTextById(rootNode: AccessibilityNodeInfo, viewId: String): String? {
+        return rootNode.findAccessibilityNodeInfosByViewId(viewId)
+            .firstOrNull()
+            ?.text
+            ?.toString()
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+    }
+
+    private fun hasNodeById(rootNode: AccessibilityNodeInfo, viewId: String): Boolean {
+        return rootNode.findAccessibilityNodeInfosByViewId(viewId).isNotEmpty()
+    }
+
+    private fun hasNodeByText(rootNode: AccessibilityNodeInfo, text: String): Boolean {
+        return rootNode.findAccessibilityNodeInfosByText(text).isNotEmpty()
+    }
+
+    private fun resetTripDetailFlow(reason: String) {
+        if (detailFlowStage == DetailFlowStage.IDLE && pendingTripClick == null) return
+        if (!isTripDetailFlowComplete()) {
+            logFlowIncomplete("reset_before_route_labels_visible reason=$reason")
+        }
+        routeLabelMonitorActive = false
+        Log.d(TAG_FLOW, "FLOW_RESET attempt=$detailFlowAttempt reason=$reason previousStage=$detailFlowStage pending=${pendingTripClick?.fingerprint ?: "none"}")
+        detailFlowStage = DetailFlowStage.IDLE
+        pendingTripClick = null
+        activeFlowContext = null
+    }
+
+    private fun logFlowWaiting(reason: String, context: TripFlowContext? = activeFlowContext) {
+        Log.d(
+            TAG_FLOW,
+            "FLOW_WAITING ${flowContextLog(context)} reason=$reason " +
+                "stage=$detailFlowStage afterFlowReset=${isContextStale(context)} " +
+                "lastEvent=[$lastFlowEventSummary] lastScreenshotReason=$lastScreenshotReason " +
+                "lastModal=[$lastModalSummary] lastRouteScan=[$lastRouteScanSummary] lastOcr=[$lastOcrSummary]"
+        )
+    }
+
+    private fun logFlowIncomplete(reason: String, context: TripFlowContext? = activeFlowContext) {
+        Log.w(
+            TAG_FLOW,
+            "FLOW_INCOMPLETE ${flowContextLog(context)} reason=$reason " +
+                "failedAt=$detailFlowStage afterFlowReset=${isContextStale(context)} " +
+                "livePending=${pendingTripClick?.fingerprint ?: "none"} screenshotInFlight=$screenshotInFlight lastEvent=[$lastFlowEventSummary] " +
+                "lastScreenshotReason=$lastScreenshotReason lastModal=[$lastModalSummary] " +
+                "lastRouteScan=[$lastRouteScanSummary] lastOcr=[$lastOcrSummary]"
+        )
+    }
+
+    private fun flowContextLog(context: TripFlowContext? = activeFlowContext): String {
+        return "attempt=${context?.attemptId ?: detailFlowAttempt} pending=${context?.fingerprint ?: "none"}"
+    }
+
+    private fun isContextStale(context: TripFlowContext?): Boolean {
+        return context != null && activeFlowContext?.attemptId != context.attemptId
+    }
+
+    private fun describeFlowEvent(event: AccessibilityEvent): String {
+        val eventText = event.text
+            .map { it.toString().trim() }
+            .filter { it.isNotEmpty() }
+            .take(6)
+            .joinToString("|")
+            .ifEmpty { "none" }
+        return "type=${event.eventType} class=${event.className ?: "none"} " +
+            "contentDesc=${event.contentDescription ?: "none"} text=$eventText"
     }
 
     private fun processMainFlow() {
@@ -240,6 +740,7 @@ class ScraperAccessibilityService : AccessibilityService() {
     }
 
     private fun clearAllOverlays() {
+        val removedCount = activeOverlays.size
         val iterator = activeOverlays.entries.iterator()
         while (iterator.hasNext()) {
             val entry = iterator.next()
@@ -247,6 +748,10 @@ class ScraperAccessibilityService : AccessibilityService() {
                 windowManager.removeView(entry.value.view)
             } catch (e: Exception) {}
             iterator.remove()
+        }
+        if (removedCount > 0) {
+            overlayClearGeneration += 1
+            Log.d(TAG_FLOW, "OVERLAYS_CLEARED attempt=$detailFlowAttempt removed=$removedCount generation=$overlayClearGeneration")
         }
     }
 
@@ -279,6 +784,7 @@ class ScraperAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         clearAllOverlays()
+        screenshotExecutor.shutdownNow()
         super.onDestroy()
     }
 
