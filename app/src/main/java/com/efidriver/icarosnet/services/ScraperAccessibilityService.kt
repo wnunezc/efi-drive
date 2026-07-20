@@ -883,17 +883,14 @@ class ScraperAccessibilityService : AccessibilityService() {
                         val sText = sibling.text?.toString() ?: "NoText"
                         val sDesc = sibling.contentDescription?.toString() ?: "NoDesc"
                         Log.e(TAG_SONDA, "  DATO ENTORNO -> Txt: '\$sText' | Desc: '\$sDesc' | Class: \${sibling.className}")
-                        sibling.recycle()
                     }
                 }
-                parent.recycle()
             }
         }
 
         for (i in 0 until node.childCount) {
             val child = node.getChild(i)
             recorrerNodosPorEstructura(child)
-            child?.recycle()
         }
     }
 
