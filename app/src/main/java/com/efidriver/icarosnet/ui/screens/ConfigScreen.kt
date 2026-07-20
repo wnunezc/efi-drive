@@ -22,6 +22,7 @@ fun ConfigScreen() {
 
     var maxPickup by remember { mutableStateOf(formatDecimal(settingsManager.maxPickupDistance)) }
     var minUsdKm by remember { mutableStateOf(formatDecimal(settingsManager.minUsdPerKm)) }
+    var previewTripDistance by remember { mutableStateOf(formatDecimal(settingsManager.previewTripDistanceKm)) }
     var commission by remember { mutableStateOf(formatDecimal(settingsManager.commissionPercent)) }
 
     Column(
@@ -61,6 +62,18 @@ fun ConfigScreen() {
                 minUsdKm = it
                 val sanitized = it.replace(",", ".")
                 sanitized.toDoubleOrNull()?.let { v -> settingsManager.minUsdPerKm = v }
+            }
+        )
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        ConfigInput(
+            label = "Distancia Estimada Viaje Preview (km)",
+            value = previewTripDistance,
+            onValueChange = {
+                previewTripDistance = it
+                val sanitized = it.replace(",", ".")
+                sanitized.toDoubleOrNull()?.let { v -> settingsManager.previewTripDistanceKm = v }
             }
         )
 

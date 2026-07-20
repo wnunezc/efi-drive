@@ -121,6 +121,8 @@ object RouteLabelOcr {
             .replace("í", "i")
             .replace("ı", "i")
             .replace("rn", "m")
+            .replace(Regex("\\bk\\s*m\\b"), "km")
+            .replace(Regex("\\bk\\s*mn\\b"), "kmn")
             .replace(Regex("\\s+"), " ")
             .trim()
 
@@ -130,7 +132,7 @@ object RouteLabelOcr {
             ?.getOrNull(1)
             ?.toIntOrNull()
 
-        val distanceMatch = Regex("""(\d{1,4}(?:[,.]\d{1,2})?)\s*(km|k[mn]|metro|metros|m)\b""")
+        val distanceMatch = Regex("""(\d{1,4}(?:[,.]\d{1,2})?)\s*(kmn|kmm|km|kn|metro|metros|mts|mt|m)\b""")
             .findAll(normalized)
             .lastOrNull()
 
@@ -143,8 +145,8 @@ object RouteLabelOcr {
         val distanceUnit = distanceMatch?.groupValues?.getOrNull(2)
         val distanceKm = when {
             distanceValue == null -> null
-            distanceUnit == "km" || distanceUnit == "kn" -> distanceValue
-            distanceUnit == "metro" || distanceUnit == "metros" || distanceUnit == "m" -> distanceValue / 1000.0
+            distanceUnit == "km" || distanceUnit == "kn" || distanceUnit == "kmn" || distanceUnit == "kmm" -> distanceValue
+            distanceUnit == "metro" || distanceUnit == "metros" || distanceUnit == "mts" || distanceUnit == "mt" || distanceUnit == "m" -> distanceValue / 1000.0
             else -> null
         }
 

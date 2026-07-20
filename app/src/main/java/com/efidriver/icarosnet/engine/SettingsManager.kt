@@ -19,6 +19,10 @@ class SettingsManager(context: Context) {
         get() = roundToTwo(prefs.getFloat("min_usd_km", 0.80f))
         set(value) = prefs.edit().putFloat("min_usd_km", value.toFloat()).apply()
 
+    var previewTripDistanceKm: Double
+        get() = roundToTwo(prefs.getFloat("preview_trip_distance_km", 1.0f))
+        set(value) = prefs.edit().putFloat("preview_trip_distance_km", value.toFloat()).apply()
+
     var commissionPercent: Double
         get() = roundToTwo(prefs.getFloat("commission", 15.0f))
         set(value) = prefs.edit().putFloat("commission", value.toFloat()).apply()

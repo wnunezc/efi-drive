@@ -11,6 +11,7 @@ import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
 import android.view.View
@@ -27,6 +28,7 @@ import com.efidriver.icarosnet.models.TripStatus
 import com.efidriver.icarosnet.models.ProfitabilityResult
 import com.efidriver.icarosnet.engine.SettingsManager
 import java.util.concurrent.Executors
+import kotlin.math.max
 
 @SuppressLint("AccessibilityPolicy")
 class ScraperAccessibilityService : AccessibilityService() {
@@ -40,6 +42,7 @@ class ScraperAccessibilityService : AccessibilityService() {
     private val mainHandler = Handler(Looper.getMainLooper())
     
     private val activeOverlays = mutableMapOf<String, OverlayRecord>()
+    private var detailProfitabilityOverlay: View? = null
 
     private enum class DetailFlowStage {
         IDLE,
@@ -71,6 +74,19 @@ class ScraperAccessibilityService : AccessibilityService() {
             get() = trip.fingerprint
     }
 
+    private data class FlowTiming(
+        var cardClickedAt: Long = 0L,
+        var modalRenderedAt: Long = 0L,
+        var screenshotRequestedAt: Long = 0L,
+        var screenshotCallbackAt: Long = 0L,
+        var scanStartedAt: Long = 0L,
+        var scanCompletedAt: Long = 0L,
+        var labelsVisibleAt: Long = 0L,
+        var ocrRequestedAt: Long = 0L,
+        var ocrCompletedAt: Long = 0L,
+        var overlayShownAt: Long = 0L
+    )
+
     private var detailFlowStage = DetailFlowStage.IDLE
     private var pendingTripClick: PendingTripClick? = null
     private var activeFlowContext: TripFlowContext? = null
@@ -84,6 +100,7 @@ class ScraperAccessibilityService : AccessibilityService() {
     private var routeLabelMonitorActive = false
     private var routeLabelScanCount = 0
     private var overlayClearGeneration = 0L
+    private val flowTimings = mutableMapOf<Long, FlowTiming>()
 
     private data class OverlayRecord(
         val view: View,
@@ -123,6 +140,7 @@ class ScraperAccessibilityService : AccessibilityService() {
                 if (packageName != "com.efidriver.icarosnet") {
                     resetTripDetailFlow("external_package=$packageName")
                     clearAllOverlays()
+                    removeDetailProfitabilityOverlay()
                 }
             }
         }
@@ -139,10 +157,13 @@ class ScraperAccessibilityService : AccessibilityService() {
                     logFlowIncomplete("new_trip_clicked_before_completion")
                 }
                 detailFlowAttempt += 1
+                pruneFlowTimings()
                 pendingTripClick = tripClick
                 activeFlowContext = TripFlowContext(detailFlowAttempt, tripClick)
+                timingFor(detailFlowAttempt).cardClickedAt = nowMs()
                 detailFlowStage = DetailFlowStage.CARD_CLICKED
                 clearAllOverlays()
+                removeDetailProfitabilityOverlay()
                 lastScreenshotReason = "none"
                 lastModalSummary = "none"
                 lastRouteScanSummary = "none"
@@ -161,6 +182,7 @@ class ScraperAccessibilityService : AccessibilityService() {
             AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
                 if (detailFlowStage == DetailFlowStage.CARD_CLICKED && isTripDetailWindowEvent(event)) {
                     detailFlowStage = DetailFlowStage.MODAL_RENDERED
+                    activeFlowContext?.let { timingFor(it.attemptId).modalRenderedAt = nowMs() }
                     Log.d(
                         TAG_FLOW,
                         "MODAL_RENDERED_BY_WINDOW ${flowContextLog()} " +
@@ -199,6 +221,7 @@ class ScraperAccessibilityService : AccessibilityService() {
                     lastModalSummary = "visible=true modal=${modalTrip?.fingerprint ?: "unknown"} " +
                         "matches=${modalTrip?.fingerprint == pendingTripClick?.fingerprint}"
                     detailFlowStage = DetailFlowStage.MODAL_RENDERED
+                    activeFlowContext?.let { timingFor(it.attemptId).modalRenderedAt = nowMs() }
                     Log.d(
                         TAG_FLOW,
                         "MODAL_RENDERED ${flowContextLog()} " +
@@ -291,6 +314,7 @@ class ScraperAccessibilityService : AccessibilityService() {
         routeLabelScanCount += 1
         lastScreenshotReason = reason
         val context = activeFlowContext ?: pendingTripClick?.let { TripFlowContext(detailFlowAttempt, it) }
+        context?.let { timingFor(it.attemptId).screenshotRequestedAt = nowMs() }
         Log.d(TAG_FLOW, "SCREENSHOT_REQUEST ${flowContextLog(context)} scan=$routeLabelScanCount reason=$reason stage=$detailFlowStage")
 
         try {
@@ -300,6 +324,7 @@ class ScraperAccessibilityService : AccessibilityService() {
                 object : TakeScreenshotCallback {
                     override fun onSuccess(screenshot: ScreenshotResult) {
                         try {
+                            context?.let { timingFor(it.attemptId).screenshotCallbackAt = nowMs() }
                             val hardwareBuffer = screenshot.hardwareBuffer
                             val bitmap = Bitmap.wrapHardwareBuffer(hardwareBuffer, screenshot.colorSpace)?.copy(Bitmap.Config.ARGB_8888, false)
                             hardwareBuffer.close()
@@ -310,7 +335,9 @@ class ScraperAccessibilityService : AccessibilityService() {
                                 return
                             }
 
+                            context?.let { timingFor(it.attemptId).scanStartedAt = nowMs() }
                             val result = RouteLabelDetector.detect(bitmap)
+                            context?.let { timingFor(it.attemptId).scanCompletedAt = nowMs() }
                             lastRouteScanSummary = "visible=${result.routeLabelsVisible} " +
                                 "bluePixels=${result.bluePixelCount} greenPixels=${result.greenPixelCount} " +
                                 "blueBox=${result.pickupLabel?.bounds ?: "none"} " +
@@ -322,11 +349,19 @@ class ScraperAccessibilityService : AccessibilityService() {
                             )
 
                             if (result.routeLabelsVisible) {
+                                context?.let { timingFor(it.attemptId).labelsVisibleAt = nowMs() }
                                 if (!isContextStale(context)) {
                                     routeLabelMonitorActive = false
                                     detailFlowStage = DetailFlowStage.MAP_CHANGED
                                 }
                                 Log.d(TAG_FLOW, "ROUTE_LABELS_VISIBLE ${flowContextLog(context)} afterFlowReset=${isContextStale(context)}")
+                                if (!isContextStale(context)) {
+                                    mainHandler.post {
+                                        if (!isContextStale(context)) {
+                                            showDetailProgressOverlay()
+                                        }
+                                    }
+                                }
                                 requestRouteLabelOcr(bitmap, result, context)
                             } else {
                                 logFlowWaiting("route_labels_not_visible_after_screenshot", context)
@@ -371,11 +406,13 @@ class ScraperAccessibilityService : AccessibilityService() {
             "ROUTE_LABEL_OCR_REQUEST ${flowContextLog(context)} afterFlowReset=${isContextStale(context)} " +
                 "blueBox=${detection.pickupLabel?.bounds ?: "none"} greenBox=${detection.destinationLabel?.bounds ?: "none"}"
         )
+        context?.let { timingFor(it.attemptId).ocrRequestedAt = nowMs() }
 
         RouteLabelOcr.recognize(
             source = bitmap,
             detection = detection,
             onSuccess = { result ->
+                context?.let { timingFor(it.attemptId).ocrCompletedAt = nowMs() }
                 lastOcrSummary = "complete=${result.complete} " +
                     "pickupRaw=${result.pickup.rawText} pickupMin=${result.pickup.minutes} pickupKm=${result.pickup.distanceKm} " +
                     "destinationRaw=${result.destination.rawText} destinationMin=${result.destination.minutes} destinationKm=${result.destination.distanceKm}"
@@ -385,14 +422,19 @@ class ScraperAccessibilityService : AccessibilityService() {
                 )
 
                 if (result.complete) {
+                    val profitability = calculateRealProfitability(context, result)
                     if (!isContextStale(context)) {
                         detailFlowStage = DetailFlowStage.OCR_COMPLETED
+                        if (profitability != null) {
+                            showDetailProfitabilityOverlay(profitability, result)
+                        }
                     }
                     Log.d(
                         TAG_FLOW,
                         "ROUTE_LABEL_METRICS_READY ${flowContextLog(context)} afterFlowReset=${isContextStale(context)} " +
                             "pickupMin=${result.pickup.minutes} pickupKm=${result.pickup.distanceKm} " +
-                            "destinationMin=${result.destination.minutes} destinationKm=${result.destination.distanceKm}"
+                            "destinationMin=${result.destination.minutes} destinationKm=${result.destination.distanceKm} " +
+                            "profitability=${profitability?.expectedUsdPerKm ?: "none"} profit=${profitability?.trueProfit ?: "none"}"
                     )
                 } else {
                     logFlowIncomplete("ocr_parse_incomplete", context)
@@ -403,6 +445,33 @@ class ScraperAccessibilityService : AccessibilityService() {
                 logFlowIncomplete("ocr_failed message=${exception.message}", context)
             }
         )
+    }
+
+    private fun calculateRealProfitability(
+        context: TripFlowContext?,
+        ocrResult: RouteLabelOcr.OcrResult
+    ): ProfitabilityResult? {
+        val tripPrice = context?.trip?.priceText?.let(::parsePriceText) ?: return null
+        val pickupDistanceKm = ocrResult.pickup.distanceKm ?: return null
+        val tripDistanceKm = ocrResult.destination.distanceKm ?: return null
+
+        return ProfitabilityEngine.calculate(
+            tripPrice = tripPrice,
+            pickupDistanceKm = pickupDistanceKm,
+            tripDistanceKm = tripDistanceKm,
+            maxPickupDistanceKm = settingsManager.maxPickupDistance,
+            minUsdPerKm = settingsManager.minUsdPerKm,
+            commissionPercent = settingsManager.commissionPercent,
+            isPreview = false
+        )
+    }
+
+    private fun parsePriceText(priceText: String): Double? {
+        return priceText
+            .replace("$", "")
+            .replace(",", ".")
+            .trim()
+            .toDoubleOrNull()
     }
 
     private fun scheduleRouteLabelRescan(reason: String) {
@@ -520,6 +589,7 @@ class ScraperAccessibilityService : AccessibilityService() {
             logFlowIncomplete("reset_before_route_labels_visible reason=$reason")
         }
         routeLabelMonitorActive = false
+        removeDetailProfitabilityOverlay()
         Log.d(TAG_FLOW, "FLOW_RESET attempt=$detailFlowAttempt reason=$reason previousStage=$detailFlowStage pending=${pendingTripClick?.fingerprint ?: "none"}")
         detailFlowStage = DetailFlowStage.IDLE
         pendingTripClick = null
@@ -576,6 +646,7 @@ class ScraperAccessibilityService : AccessibilityService() {
         val maxP = settingsManager.maxPickupDistance
         val minU = settingsManager.minUsdPerKm
         val comm = settingsManager.commissionPercent
+        val previewTripDistance = settingsManager.previewTripDistanceKm
 
         for (node in nodes) {
             val trip = extractTripData(node) ?: continue
@@ -585,9 +656,11 @@ class ScraperAccessibilityService : AccessibilityService() {
             val result = ProfitabilityEngine.calculate(
                 tripPrice = trip.price,
                 pickupDistanceKm = trip.pickupDistance,
+                tripDistanceKm = previewTripDistance,
                 maxPickupDistanceKm = maxP,
                 minUsdPerKm = minU,
-                commissionPercent = comm
+                commissionPercent = comm,
+                isPreview = true
             )
 
             if (result.status != TripStatus.RENTABLE) {
@@ -730,6 +803,189 @@ class ScraperAccessibilityService : AccessibilityService() {
             textSize = 10f
         })
         container.addView(footerContainer)
+    }
+
+    private fun showDetailProfitabilityOverlay(
+        result: ProfitabilityResult,
+        ocrResult: RouteLabelOcr.OcrResult
+    ) {
+        removeDetailProfitabilityOverlay()
+
+        val displayMetrics = resources.displayMetrics
+        val overlayWidth = (displayMetrics.widthPixels * 0.60).toInt()
+        val overlayHeight = (112 * displayMetrics.density).toInt()
+        val params = WindowManager.LayoutParams(
+            overlayWidth,
+            overlayHeight,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = (displayMetrics.widthPixels - overlayWidth) / 2
+            y = max((178 * displayMetrics.density).toInt(), 0)
+        }
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(
+                (14 * displayMetrics.density).toInt(),
+                (8 * displayMetrics.density).toInt(),
+                (14 * displayMetrics.density).toInt(),
+                (8 * displayMetrics.density).toInt()
+            )
+            background = GradientDrawable().apply {
+                cornerRadius = 8 * displayMetrics.density
+                setColor(
+                    if (result.status == TripStatus.RENTABLE) {
+                        Color.parseColor("#E6004D00")
+                    } else {
+                        Color.parseColor("#E69A1B1B")
+                    }
+                )
+            }
+        }
+
+        updateDetailProfitabilityText(container, result, ocrResult)
+
+        try {
+            windowManager.addView(container, params)
+            detailProfitabilityOverlay = container
+            activeFlowContext?.let { context ->
+                val timing = timingFor(context.attemptId)
+                timing.overlayShownAt = nowMs()
+                Log.d(TAG_FLOW, "FLOW_TIMING ${flowContextLog(context)} ${formatFlowTiming(timing)}")
+            }
+            Log.d(
+                TAG_FLOW,
+                "DETAIL_PROFITABILITY_OVERLAY_SHOWN ${flowContextLog()} " +
+                    "status=${result.status} usdKm=${result.expectedUsdPerKm} profit=${result.trueProfit} " +
+                    "pickupKm=${result.pickupDistanceKm} totalKm=${result.totalDistanceKm}"
+            )
+        } catch (e: Exception) {
+            Log.e(TAG_FLOW, "DETAIL_PROFITABILITY_OVERLAY_FAILED ${e.message}", e)
+        }
+    }
+
+    private fun showDetailProgressOverlay() {
+        removeDetailProfitabilityOverlay()
+
+        val displayMetrics = resources.displayMetrics
+        val overlayWidth = (displayMetrics.widthPixels * 0.60).toInt()
+        val overlayHeight = (72 * displayMetrics.density).toInt()
+        val params = WindowManager.LayoutParams(
+            overlayWidth,
+            overlayHeight,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = (displayMetrics.widthPixels - overlayWidth) / 2
+            y = max((178 * displayMetrics.density).toInt(), 0)
+        }
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                cornerRadius = 8 * displayMetrics.density
+                setColor(Color.parseColor("#E6333333"))
+            }
+        }
+        container.addView(TextView(this).apply {
+            text = "CALCULANDO..."
+            setTextColor(Color.WHITE)
+            textSize = 15f
+            gravity = Gravity.CENTER
+            setTypeface(null, Typeface.BOLD)
+        })
+        container.addView(TextView(this).apply {
+            text = "Leyendo distancia y tiempo"
+            setTextColor(Color.WHITE)
+            textSize = 12f
+            gravity = Gravity.CENTER
+        })
+
+        try {
+            windowManager.addView(container, params)
+            detailProfitabilityOverlay = container
+            Log.d(TAG_FLOW, "DETAIL_PROGRESS_OVERLAY_SHOWN ${flowContextLog()}")
+        } catch (e: Exception) {
+            Log.e(TAG_FLOW, "DETAIL_PROGRESS_OVERLAY_FAILED ${e.message}", e)
+        }
+    }
+
+    private fun updateDetailProfitabilityText(
+        container: LinearLayout,
+        result: ProfitabilityResult,
+        ocrResult: RouteLabelOcr.OcrResult
+    ) {
+        val title = when (result.status) {
+            TripStatus.RENTABLE -> "RENTABLE REAL"
+            TripStatus.NOT_RENTABLE_PICKUP -> "RECOGIDA LEJOS"
+            TripStatus.NOT_RENTABLE -> "NO RENTABLE"
+        }
+        container.addView(TextView(this).apply {
+            text = title
+            setTextColor(Color.WHITE)
+            textSize = 16f
+            gravity = Gravity.CENTER
+            setTypeface(null, Typeface.BOLD)
+        })
+        container.addView(TextView(this).apply {
+            text = String.format("%.2f $/km  |  Gana: $%.2f", result.expectedUsdPerKm, result.trueProfit)
+            setTextColor(Color.WHITE)
+            textSize = 13f
+            gravity = Gravity.CENTER
+        })
+        container.addView(TextView(this).apply {
+            text = "Tiempo: ${ocrResult.pickup.minutes ?: "-"} + ${ocrResult.destination.minutes ?: "-"} min  |  Total: " +
+                String.format("%.1f km", result.totalDistanceKm)
+            setTextColor(Color.WHITE)
+            textSize = 12f
+            gravity = Gravity.CENTER
+        })
+    }
+
+    private fun removeDetailProfitabilityOverlay() {
+        detailProfitabilityOverlay?.let {
+            try {
+                windowManager.removeView(it)
+            } catch (e: Exception) {}
+        }
+        detailProfitabilityOverlay = null
+    }
+
+    private fun nowMs(): Long = SystemClock.elapsedRealtime()
+
+    private fun timingFor(attemptId: Long): FlowTiming {
+        return flowTimings.getOrPut(attemptId) { FlowTiming() }
+    }
+
+    private fun pruneFlowTimings() {
+        val oldestToKeep = detailFlowAttempt - 20
+        flowTimings.keys.filter { it < oldestToKeep }.forEach { flowTimings.remove(it) }
+    }
+
+    private fun formatFlowTiming(timing: FlowTiming): String {
+        fun delta(from: Long, to: Long): Long? {
+            return if (from > 0L && to > 0L) to - from else null
+        }
+
+        return "clickToModal=${delta(timing.cardClickedAt, timing.modalRenderedAt) ?: "na"}ms " +
+            "modalToScreenshotRequest=${delta(timing.modalRenderedAt, timing.screenshotRequestedAt) ?: "na"}ms " +
+            "screenshotRequestToCallback=${delta(timing.screenshotRequestedAt, timing.screenshotCallbackAt) ?: "na"}ms " +
+            "scanDuration=${delta(timing.scanStartedAt, timing.scanCompletedAt) ?: "na"}ms " +
+            "screenshotCallbackToLabels=${delta(timing.screenshotCallbackAt, timing.labelsVisibleAt) ?: "na"}ms " +
+            "labelsToOcrResult=${delta(timing.labelsVisibleAt, timing.ocrCompletedAt) ?: "na"}ms " +
+            "ocrResultToOverlay=${delta(timing.ocrCompletedAt, timing.overlayShownAt) ?: "na"}ms " +
+            "clickToOverlay=${delta(timing.cardClickedAt, timing.overlayShownAt) ?: "na"}ms"
     }
 
     private fun removeOverlay(tripKey: String) {

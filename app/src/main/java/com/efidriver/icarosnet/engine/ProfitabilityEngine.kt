@@ -12,7 +12,8 @@ object ProfitabilityEngine {
         tripDistanceKm: Double = 1.0, 
         maxPickupDistanceKm: Double,
         minUsdPerKm: Double,
-        commissionPercent: Double
+        commissionPercent: Double,
+        isPreview: Boolean = true
     ): ProfitabilityResult {
         
         // 1. Neto tras comisión
@@ -46,7 +47,7 @@ object ProfitabilityEngine {
             totalDistanceKm = totalDistanceKm,
             trueProfit = trueProfit,
             pickupDistanceKm = pickupDistanceKm,
-            isPreview = true, // Siempre true en esta fase de lista de viajes
+            isPreview = isPreview,
             pickupAccepted = pickupAccepted,
             tripAccepted = (status == TripStatus.RENTABLE)
         )
