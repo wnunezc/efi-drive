@@ -13,12 +13,15 @@ data class Trip(
     val toAddress: String,
     val timestamp: Long = System.currentTimeMillis()
 ) {
+    val identity: TripIdentity by lazy {
+        TripIdentity.from(passengerName, fromAddress, toAddress)
+    }
+
     /**
      * Genera una Huella Digital única para identificar el viaje aunque se mueva en la lista.
      * Esta es la 'Llave Maestra' que mencionamos.
      */
     val fingerprint: String by lazy {
-        "${passengerName}_${fromAddress}"
-            .replace("\\s".toRegex(), "") // Quitar espacios para normalizar
+        identity.bestKey
     }
 }

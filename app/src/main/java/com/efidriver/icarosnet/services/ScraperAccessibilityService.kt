@@ -20,9 +20,13 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.LinearLayout
 import android.widget.TextView
+import com.efidriver.icarosnet.engine.TripEvaluationCache
+import com.efidriver.icarosnet.engine.TripEvaluationKind
+import com.efidriver.icarosnet.engine.TripEvaluationSnapshot
 import com.efidriver.icarosnet.vision.RouteLabelDetector
 import com.efidriver.icarosnet.vision.RouteLabelOcr
 import com.efidriver.icarosnet.models.Trip
+import com.efidriver.icarosnet.models.TripIdentity
 import com.efidriver.icarosnet.engine.ProfitabilityEngine
 import com.efidriver.icarosnet.models.TripStatus
 import com.efidriver.icarosnet.models.ProfitabilityResult
@@ -61,9 +65,8 @@ class ScraperAccessibilityService : AccessibilityService() {
         val pickupAddress: String,
         val destinationAddress: String
     ) {
-        val fingerprint: String = listOf(passengerName, priceText, pickupAddress, destinationAddress)
-            .joinToString("|")
-            .replace("\\s".toRegex(), "")
+        val identity: TripIdentity = TripIdentity.from(passengerName, pickupAddress, destinationAddress)
+        val fingerprint: String = identity.bestKey
     }
 
     private data class TripFlowContext(
@@ -109,6 +112,7 @@ class ScraperAccessibilityService : AccessibilityService() {
     private var listOverlayRenderingBlocked = false
     private var listWithoutModalEventCount = 0
     private val flowTimings = mutableMapOf<Long, FlowTiming>()
+    private val tripEvaluationCache = TripEvaluationCache()
 
     private data class OverlayRecord(
         val view: View,
@@ -533,6 +537,9 @@ class ScraperAccessibilityService : AccessibilityService() {
 
                 if (result.complete) {
                     val profitability = calculateRealProfitability(context, result)
+                    if (profitability != null) {
+                        storeRealTripEvaluation(context, result, profitability)
+                    }
                     if (!isContextStale(context)) {
                         detailFlowStage = DetailFlowStage.OCR_COMPLETED
                         if (profitability != null) {
@@ -579,6 +586,31 @@ class ScraperAccessibilityService : AccessibilityService() {
                 "lastOcr=[$lastOcrSummary]"
         }
         scheduleRouteLabelRescan("ocr_parse_incomplete_retry_$routeLabelOcrRetryCount")
+    }
+
+    private fun storeRealTripEvaluation(
+        context: TripFlowContext?,
+        ocrResult: RouteLabelOcr.OcrResult,
+        profitability: ProfitabilityResult
+    ) {
+        val trip = context?.trip ?: return
+        val price = parsePriceText(trip.priceText) ?: return
+        val pickupDistanceKm = ocrResult.pickup.distanceKm ?: return
+        val tripDistanceKm = ocrResult.destination.distanceKm ?: return
+        tripEvaluationCache.store(
+            TripEvaluationSnapshot(
+                identity = trip.identity,
+                kind = TripEvaluationKind.REAL,
+                profitability = profitability,
+                price = price,
+                pickupDistanceKm = pickupDistanceKm,
+                tripDistanceKm = tripDistanceKm,
+                pickupMinutes = ocrResult.pickup.minutes,
+                tripMinutes = ocrResult.destination.minutes,
+                updatedAtMs = nowMs()
+            )
+        )
+        Log.d(TAG_FLOW, "REAL_EVALUATION_STORED attempt=${context.attemptId} status=${profitability.status} usdKm=${profitability.expectedUsdPerKm}")
     }
 
     private fun calculateRealProfitability(
@@ -833,7 +865,18 @@ class ScraperAccessibilityService : AccessibilityService() {
             val tripKey = trip.fingerprint
             foundKeysInThisScan.add(tripKey)
 
-            val result = ProfitabilityEngine.calculate(
+            val realSnapshot = tripEvaluationCache.findReal(trip.identity, nowMs())
+            val result = realSnapshot?.let { snapshot ->
+                ProfitabilityEngine.calculate(
+                    tripPrice = trip.price,
+                    pickupDistanceKm = snapshot.pickupDistanceKm,
+                    tripDistanceKm = snapshot.tripDistanceKm,
+                    maxPickupDistanceKm = maxP,
+                    minUsdPerKm = minU,
+                    commissionPercent = comm,
+                    isPreview = false
+                )
+            } ?: ProfitabilityEngine.calculate(
                 tripPrice = trip.price,
                 pickupDistanceKm = trip.pickupDistance,
                 tripDistanceKm = previewTripDistance,
@@ -843,7 +886,16 @@ class ScraperAccessibilityService : AccessibilityService() {
                 isPreview = true
             )
 
-            if (result.status != TripStatus.RENTABLE) {
+            if (realSnapshot != null) {
+                val currentBounds = Rect()
+                node.getBoundsInScreen(currentBounds)
+                syncOverlay(tripKey, currentBounds, result)
+                logFlowDebug {
+                    "LIST_REAL_OVERLAY_USED key=$tripKey status=${result.status} " +
+                        "storedPrice=${realSnapshot.price} currentPrice=${trip.price} " +
+                        "pickupKm=${realSnapshot.pickupDistanceKm} tripKm=${realSnapshot.tripDistanceKm}"
+                }
+            } else if (result.status != TripStatus.RENTABLE) {
                 if (trip.pickupDistance > 0.05) executeDirectHide(node)
             } else {
                 val currentBounds = Rect()
@@ -917,6 +969,7 @@ class ScraperAccessibilityService : AccessibilityService() {
             if (activeOverlays.containsKey(tripKey)) {
                 val record = activeOverlays[tripKey]!!
                 updateHUDText(record.textContainer, result)
+                applyListOverlayBackground(record.view, result)
                 if (record.lastBounds != bounds) {
                     record.lastBounds = Rect(bounds)
                     windowManager.updateViewLayout(record.view, params)
@@ -925,8 +978,8 @@ class ScraperAccessibilityService : AccessibilityService() {
                 val container = LinearLayout(this).apply {
                     orientation = LinearLayout.VERTICAL
                     gravity = Gravity.CENTER
-                    setBackgroundColor(Color.parseColor("#E6004D00"))
                 }
+                applyListOverlayBackground(container, result)
                 updateHUDText(container, result)
                 windowManager.addView(container, params)
                 activeOverlays[tripKey] = OverlayRecord(container, container, Rect(bounds))
@@ -934,10 +987,24 @@ class ScraperAccessibilityService : AccessibilityService() {
         } catch (e: Exception) {}
     }
 
+    private fun applyListOverlayBackground(view: View, result: ProfitabilityResult) {
+        val color = when {
+            result.status == TripStatus.RENTABLE -> "#E6004D00"
+            !result.isPreview -> "#E69A1B1B"
+            else -> "#E6333333"
+        }
+        view.setBackgroundColor(Color.parseColor(color))
+    }
+
     private fun updateHUDText(container: LinearLayout, result: ProfitabilityResult) {
         container.removeAllViews()
         container.addView(TextView(this).apply {
-            text = "RENTABLE"
+            text = when {
+                result.isPreview && result.status == TripStatus.RENTABLE -> "PREVIEW"
+                result.status == TripStatus.RENTABLE -> "REAL"
+                result.status == TripStatus.NOT_RENTABLE_PICKUP -> "REAL LEJOS"
+                else -> "REAL NO RENT."
+            }
             setTextColor(Color.WHITE)
             textSize = 14f
             gravity = Gravity.CENTER
@@ -1215,8 +1282,25 @@ class ScraperAccessibilityService : AccessibilityService() {
             val priceT = node.findAccessibilityNodeInfosByViewId("sinet.startup.inDriver:id/info_textview_stage_price_view").firstOrNull()?.text?.toString() ?: ""
             val distT = node.findAccessibilityNodeInfosByViewId("sinet.startup.inDriver:id/order_info_stage_textview_distance").firstOrNull()?.text?.toString() ?: ""
             val from = node.findAccessibilityNodeInfosByViewId("sinet.startup.inDriver:id/order_info_textview_from_address").firstOrNull()?.text?.toString() ?: ""
-            Trip(name.trim(), parseDoubleSafe(priceT), parseDoubleSafe(distT), from.trim(), "")
+            val to = findFirstTextByIds(
+                node,
+                "sinet.startup.inDriver:id/order_info_textview_to_address",
+                "sinet.startup.inDriver:id/order_info_textview_destination_address",
+                "sinet.startup.inDriver:id/order_info_stage_textview_to_address"
+            ) ?: ""
+            Trip(name.trim(), parseDoubleSafe(priceT), parseDoubleSafe(distT), from.trim(), to.trim())
         } catch (e: Exception) { null }
+    }
+
+    private fun findFirstTextByIds(node: AccessibilityNodeInfo, vararg viewIds: String): String? {
+        return viewIds.firstNotNullOfOrNull { viewId ->
+            node.findAccessibilityNodeInfosByViewId(viewId)
+                .firstOrNull()
+                ?.text
+                ?.toString()
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+        }
     }
 
     private fun parseDoubleSafe(text: String): Double {
