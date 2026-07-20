@@ -16,13 +16,92 @@ object RouteLabelDetector {
         val pickupLabel: LabelCandidate?,
         val destinationLabel: LabelCandidate?,
         val bluePixelCount: Int,
-        val greenPixelCount: Int
+        val greenPixelCount: Int,
+        val mode: String,
+        val pickupCandidates: List<LabelCandidate> = pickupLabel?.let(::listOf) ?: emptyList(),
+        val destinationCandidates: List<LabelCandidate> = destinationLabel?.let(::listOf) ?: emptyList()
     ) {
         val routeLabelsVisible: Boolean
             get() = pickupLabel != null && destinationLabel != null
     }
 
     fun detect(bitmap: Bitmap): DetectionResult {
+        detectFast(bitmap)?.let { return it }
+        return detectFullResolution(bitmap)
+    }
+
+    private fun detectFast(bitmap: Bitmap): DetectionResult? {
+        val sample = 2
+        val roi = Rect(
+            0,
+            (bitmap.height * 0.08).toInt(),
+            bitmap.width,
+            (bitmap.height * 0.56).toInt()
+        )
+        val sampledWidth = roi.width() / sample
+        val sampledHeight = roi.height() / sample
+        if (sampledWidth <= 0 || sampledHeight <= 0) return null
+
+        val pixels = IntArray(roi.width() * roi.height())
+        bitmap.getPixels(pixels, 0, roi.width(), roi.left, roi.top, roi.width(), roi.height())
+
+        val blueMatches = BooleanArray(sampledWidth * sampledHeight)
+        val greenMatches = BooleanArray(sampledWidth * sampledHeight)
+        var blueTotal = 0
+        var greenTotal = 0
+
+        for (sy in 0 until sampledHeight) {
+            val sourceY = sy * sample
+            val sourceRow = sourceY * roi.width()
+            val sampledRow = sy * sampledWidth
+            for (sx in 0 until sampledWidth) {
+                val color = pixels[sourceRow + sx * sample]
+                val red = Color.red(color)
+                val green = Color.green(color)
+                val blue = Color.blue(color)
+                val index = sampledRow + sx
+                if (isPickupBlue(red, green, blue)) {
+                    blueMatches[index] = true
+                    blueTotal++
+                }
+                if (isDestinationGreen(red, green, blue)) {
+                    greenMatches[index] = true
+                    greenTotal++
+                }
+            }
+        }
+
+        val sampledRoi = Rect(
+            roi.left / sample,
+            roi.top / sample,
+            roi.right / sample,
+            roi.bottom / sample
+        )
+        val blueMask = ColorMask(sampledWidth, sampledHeight, blueMatches, blueTotal)
+        val greenMask = ColorMask(sampledWidth, sampledHeight, greenMatches, greenTotal)
+        val pickupCandidates = findLabelCandidates(blueMask, sampledRoi, sample)
+            .map { it.scale(sample) }
+        val destinationCandidates = findLabelCandidates(greenMask, sampledRoi, sample)
+            .map { it.scale(sample) }
+        val pickup = pickupCandidates.firstOrNull()
+        val destination = destinationCandidates.firstOrNull()
+
+        return if (pickup != null && destination != null) {
+            DetectionResult(
+                pickupLabel = pickup,
+                destinationLabel = destination,
+                bluePixelCount = blueTotal * sample * sample,
+                greenPixelCount = greenTotal * sample * sample,
+                mode = "fast_sample_${sample}x",
+                pickupCandidates = pickupCandidates,
+                destinationCandidates = destinationCandidates
+            )
+        } else {
+            null
+        }
+    }
+
+    private fun detectFullResolution(bitmap: Bitmap): DetectionResult {
         val roi = Rect(
             0,
             (bitmap.height * 0.08).toInt(),
@@ -37,11 +116,30 @@ object RouteLabelDetector {
         val blueMask = buildMask(pixels, width, height, ::isPickupBlue)
         val greenMask = buildMask(pixels, width, height, ::isDestinationGreen)
 
+        val pickupCandidates = findLabelCandidates(blueMask, roi)
+        val destinationCandidates = findLabelCandidates(greenMask, roi)
+
         return DetectionResult(
-            pickupLabel = findLabelCandidate(blueMask, roi),
-            destinationLabel = findLabelCandidate(greenMask, roi),
+            pickupLabel = pickupCandidates.firstOrNull(),
+            destinationLabel = destinationCandidates.firstOrNull(),
             bluePixelCount = blueMask.totalPixels,
-            greenPixelCount = greenMask.totalPixels
+            greenPixelCount = greenMask.totalPixels,
+            mode = "full_resolution",
+            pickupCandidates = pickupCandidates,
+            destinationCandidates = destinationCandidates
+        )
+    }
+
+    private fun LabelCandidate.scale(factor: Int): LabelCandidate {
+        return LabelCandidate(
+            bounds = Rect(
+                bounds.left * factor,
+                bounds.top * factor,
+                bounds.right * factor,
+                bounds.bottom * factor
+            ),
+            coloredPixels = coloredPixels * factor * factor,
+            density = density
         )
     }
 
@@ -81,13 +179,35 @@ object RouteLabelDetector {
     }
 
     private fun findLabelCandidate(mask: ColorMask, roi: Rect): LabelCandidate? {
-        return findByConnectedComponents(mask, roi) ?: findBySlidingWindow(mask, roi)
+        return findLabelCandidates(mask, roi).firstOrNull()
     }
 
-    private fun findByConnectedComponents(mask: ColorMask, roi: Rect): LabelCandidate? {
+    private fun findLabelCandidates(mask: ColorMask, roi: Rect, sample: Int = 1): List<LabelCandidate> {
+        return (
+            findByConnectedComponents(mask, roi, sample) +
+                findBySlidingWindow(mask, roi, sample)
+            )
+            .distinctBy { "${it.bounds.left}:${it.bounds.top}:${it.bounds.right}:${it.bounds.bottom}" }
+            .sortedWith(
+                compareByDescending<RouteLabelDetector.LabelCandidate> { it.coloredPixels }
+                    .thenByDescending { it.density }
+            )
+            .take(5)
+    }
+
+    private fun findByConnectedComponents(mask: ColorMask, roi: Rect, sample: Int = 1): List<LabelCandidate> {
         val visited = BooleanArray(mask.matches.size)
         val queue = IntArray(mask.matches.size)
-        var best: LabelCandidate? = null
+        val candidates = mutableListOf<LabelCandidate>()
+        val minPixels = 1_200 / (sample * sample)
+        val minWidth = 70 / sample
+        val maxWidth = 280 / sample
+        val minHeight = 45 / sample
+        val maxHeight = 170 / sample
+        val padX = (10 / sample).coerceAtLeast(2)
+        val padY = (10 / sample).coerceAtLeast(2)
+        val padRight = (11 / sample).coerceAtLeast(3)
+        val padBottom = (11 / sample).coerceAtLeast(3)
 
         for (start in mask.matches.indices) {
             if (!mask.matches[start] || visited[start]) continue
@@ -100,16 +220,16 @@ object RouteLabelDetector {
 
             val density = component.pixels.toDouble() / area.toDouble()
             if (
-                component.pixels >= 1_200 &&
+                component.pixels >= minPixels &&
                 density >= 0.35 &&
-                boundsWidth in 70..280 &&
-                boundsHeight in 45..170
+                boundsWidth in minWidth..maxWidth &&
+                boundsHeight in minHeight..maxHeight
             ) {
                 val padded = Rect(
-                    roi.left + component.minX - 10,
-                    roi.top + component.minY - 10,
-                    roi.left + component.maxX + 11,
-                    roi.top + component.maxY + 11
+                    roi.left + component.minX - padX,
+                    roi.top + component.minY - padY,
+                    roi.left + component.maxX + padRight,
+                    roi.top + component.maxY + padBottom
                 )
                 padded.intersect(roi)
                 val candidate = LabelCandidate(
@@ -117,13 +237,11 @@ object RouteLabelDetector {
                     coloredPixels = component.pixels,
                     density = density
                 )
-                if (best == null || candidate.coloredPixels > best.coloredPixels) {
-                    best = candidate
-                }
+                candidates += candidate
             }
         }
 
-        return best
+        return candidates
     }
 
     private fun floodFill(
@@ -177,12 +295,13 @@ object RouteLabelDetector {
         return component
     }
 
-    private fun findBySlidingWindow(mask: ColorMask, roi: Rect): LabelCandidate? {
+    private fun findBySlidingWindow(mask: ColorMask, roi: Rect, sample: Int = 1): List<LabelCandidate> {
         val integral = buildIntegralMask(mask)
-        var best: LabelCandidate? = null
-        val widths = intArrayOf(100, 130, 160, 190, 220)
-        val heights = intArrayOf(64, 82, 100, 118)
-        val step = 12
+        val candidates = mutableListOf<LabelCandidate>()
+        val widths = intArrayOf(100, 130, 160, 190, 220).map { (it / sample).coerceAtLeast(20) }
+        val heights = intArrayOf(64, 82, 100, 118).map { (it / sample).coerceAtLeast(16) }
+        val step = (12 / sample).coerceAtLeast(4)
+        val minColored = (1_400 / (sample * sample)).coerceAtLeast(120)
 
         for (height in heights) {
             if (height >= mask.height) continue
@@ -194,14 +313,14 @@ object RouteLabelDetector {
                     while (x + width <= mask.width) {
                         val colored = sum(integral, mask.width, x, y, width, height)
                         val density = colored.toDouble() / (width * height).toDouble()
-                        if (colored >= 1_400 && density >= 0.28) {
+                        if (colored >= minColored && density >= 0.28) {
                             val candidate = LabelCandidate(
                                 bounds = Rect(roi.left + x, roi.top + y, roi.left + x + width, roi.top + y + height),
                                 coloredPixels = colored,
                                 density = density
                             )
-                            if (best == null || candidate.coloredPixels > best.coloredPixels) {
-                                best = candidate
+                            if (candidates.none { overlapsStrongly(it.bounds, candidate.bounds) }) {
+                                candidates += candidate
                             }
                         }
                         x += step
@@ -211,7 +330,15 @@ object RouteLabelDetector {
             }
         }
 
-        return best
+        return candidates
+    }
+
+    private fun overlapsStrongly(a: Rect, b: Rect): Boolean {
+        val intersection = Rect(a)
+        if (!intersection.intersect(b)) return false
+        val smallerArea = minOf(a.width() * a.height(), b.width() * b.height())
+        if (smallerArea <= 0) return false
+        return intersection.width() * intersection.height() >= smallerArea * 0.65
     }
 
     private fun buildIntegralMask(mask: ColorMask): IntArray {

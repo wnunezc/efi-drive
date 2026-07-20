@@ -24,6 +24,7 @@ fun ConfigScreen() {
     var minUsdKm by remember { mutableStateOf(formatDecimal(settingsManager.minUsdPerKm)) }
     var previewTripDistance by remember { mutableStateOf(formatDecimal(settingsManager.previewTripDistanceKm)) }
     var commission by remember { mutableStateOf(formatDecimal(settingsManager.commissionPercent)) }
+    var structuralProbeDebugEnabled by remember { mutableStateOf(settingsManager.structuralProbeDebugEnabled) }
 
     Column(
         modifier = Modifier
@@ -89,6 +90,18 @@ fun ConfigScreen() {
             }
         )
 
+        Spacer(modifier = Modifier.height(24.dp))
+
+        DebugSwitch(
+            title = "Sonda estructural debug",
+            description = "Activa logs profundos del árbol de InDrive. Puede afectar rendimiento.",
+            checked = structuralProbeDebugEnabled,
+            onCheckedChange = {
+                structuralProbeDebugEnabled = it
+                settingsManager.structuralProbeDebugEnabled = it
+            }
+        )
+
         Spacer(modifier = Modifier.weight(1f))
         
         Card(
@@ -101,6 +114,28 @@ fun ConfigScreen() {
                 fontWeight = FontWeight.Medium
             )
         }
+    }
+}
+
+@Composable
+fun DebugSwitch(
+    title: String,
+    description: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(text = title, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+            Text(text = description, fontSize = 12.sp, color = MaterialTheme.colorScheme.secondary)
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange
+        )
     }
 }
 
