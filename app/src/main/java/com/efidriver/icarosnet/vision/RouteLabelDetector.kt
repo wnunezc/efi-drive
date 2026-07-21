@@ -297,11 +297,13 @@ object RouteLabelDetector {
 
     private fun findBySlidingWindow(mask: ColorMask, roi: Rect, sample: Int = 1): List<LabelCandidate> {
         val integral = buildIntegralMask(mask)
-        val candidates = mutableListOf<LabelCandidate>()
-        val widths = intArrayOf(100, 130, 160, 190, 220).map { (it / sample).coerceAtLeast(20) }
-        val heights = intArrayOf(64, 82, 100, 118).map { (it / sample).coerceAtLeast(16) }
+        val rawCandidates = mutableListOf<LabelCandidate>()
+        val widths = intArrayOf(100, 130, 160, 190, 220, 250).map { (it / sample).coerceAtLeast(20) }
+        val heights = intArrayOf(64, 82, 100, 118, 136).map { (it / sample).coerceAtLeast(16) }
         val step = (12 / sample).coerceAtLeast(4)
         val minColored = (1_400 / (sample * sample)).coerceAtLeast(120)
+        val padX = (18 / sample).coerceAtLeast(4)
+        val padY = (14 / sample).coerceAtLeast(4)
 
         for (height in heights) {
             if (height >= mask.height) continue
@@ -314,14 +316,19 @@ object RouteLabelDetector {
                         val colored = sum(integral, mask.width, x, y, width, height)
                         val density = colored.toDouble() / (width * height).toDouble()
                         if (colored >= minColored && density >= 0.28) {
+                            val bounds = Rect(
+                                roi.left + x - padX,
+                                roi.top + y - padY,
+                                roi.left + x + width + padX,
+                                roi.top + y + height + padY
+                            )
+                            bounds.intersect(roi)
                             val candidate = LabelCandidate(
-                                bounds = Rect(roi.left + x, roi.top + y, roi.left + x + width, roi.top + y + height),
+                                bounds = bounds,
                                 coloredPixels = colored,
                                 density = density
                             )
-                            if (candidates.none { overlapsStrongly(it.bounds, candidate.bounds) }) {
-                                candidates += candidate
-                            }
+                            rawCandidates += candidate
                         }
                         x += step
                     }
@@ -330,7 +337,19 @@ object RouteLabelDetector {
             }
         }
 
-        return candidates
+        val candidates = mutableListOf<LabelCandidate>()
+        rawCandidates
+            .sortedWith(
+                compareByDescending<LabelCandidate> { it.coloredPixels }
+                    .thenByDescending { it.density }
+            )
+            .forEach { candidate ->
+                if (candidates.none { overlapsStrongly(it.bounds, candidate.bounds) }) {
+                    candidates += candidate
+                }
+            }
+
+        return candidates.take(12)
     }
 
     private fun overlapsStrongly(a: Rect, b: Rect): Boolean {

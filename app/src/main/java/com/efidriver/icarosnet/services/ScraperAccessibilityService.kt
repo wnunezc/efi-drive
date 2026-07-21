@@ -113,6 +113,9 @@ class ScraperAccessibilityService : AccessibilityService() {
     private var listWithoutModalEventCount = 0
     private val flowTimings = mutableMapOf<Long, FlowTiming>()
     private val tripEvaluationCache = TripEvaluationCache()
+    private val maxOcrIncompleteRetries = 6
+    private val maxRouteLabelAnalysisMs = 10_000L
+    private val modalFallbackCheckIntervalMs = 250L
 
     private data class OverlayRecord(
         val view: View,
@@ -215,6 +218,7 @@ class ScraperAccessibilityService : AccessibilityService() {
                 if (!isDebugDiagnosticsEnabled()) {
                     Log.d(TAG_FLOW, "CARD_CLICKED attempt=$detailFlowAttempt price=${tripClick.priceText} pickup=${tripClick.pickupDistanceText}")
                 }
+                scheduleModalVisibilityFallback(detailFlowAttempt)
             }
 
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
@@ -353,6 +357,64 @@ class ScraperAccessibilityService : AccessibilityService() {
                 "activeOverlays=${activeOverlays.size} overlayGeneration=$overlayClearGeneration"
         }
         requestRouteLabelScreenshotWhenOverlaysGone(reason, overlayClearGeneration)
+    }
+
+    private fun scheduleModalVisibilityFallback(attemptId: Long) {
+        mainHandler.postDelayed({
+            val context = activeFlowContext ?: return@postDelayed
+            if (context.attemptId != attemptId || detailFlowStage != DetailFlowStage.CARD_CLICKED) {
+                return@postDelayed
+            }
+
+            val elapsedMs = timingFor(attemptId).cardClickedAt
+                .takeIf { it > 0L }
+                ?.let { nowMs() - it }
+                ?: 0L
+            val rootNode = rootInActiveWindow
+            if (rootNode == null) {
+                if (elapsedMs < maxRouteLabelAnalysisMs) {
+                    scheduleModalVisibilityFallback(attemptId)
+                } else {
+                    resetTripDetailFlow("modal_fallback_root_unavailable elapsedMs=$elapsedMs")
+                }
+                return@postDelayed
+            }
+
+            if (isTripDetailModalVisible(rootNode)) {
+                listWithoutModalEventCount = 0
+                val modalTrip = extractModalTrip(rootNode)
+                lastModalSummary = "visible=true modal=${modalTrip?.fingerprint ?: "unknown"} " +
+                    "matches=${modalTrip?.fingerprint == pendingTripClick?.fingerprint}"
+                detailFlowStage = DetailFlowStage.MODAL_RENDERED
+                timingFor(attemptId).modalRenderedAt = nowMs()
+                logFlowDebug {
+                    "MODAL_RENDERED_BY_FALLBACK ${flowContextLog(context)} elapsedMs=$elapsedMs " +
+                        "modal=${modalTrip?.fingerprint ?: "unknown"} " +
+                        "matches=${modalTrip?.fingerprint == pendingTripClick?.fingerprint}"
+                }
+                if (!isDebugDiagnosticsEnabled()) {
+                    Log.d(TAG_FLOW, "MODAL_RENDERED_BY_FALLBACK attempt=$attemptId elapsedMs=$elapsedMs")
+                }
+                startRouteLabelMonitor("modal_visibility_fallback")
+                return@postDelayed
+            }
+
+            if (isTripListVisible(rootNode)) {
+                listWithoutModalEventCount += 1
+                if (shouldResetDetailFlowFromTripListOnly() || elapsedMs >= maxRouteLabelAnalysisMs) {
+                    resetTripDetailFlow("modal_not_opened_after_click elapsedMs=$elapsedMs events=$listWithoutModalEventCount")
+                } else {
+                    scheduleModalVisibilityFallback(attemptId)
+                }
+                return@postDelayed
+            }
+
+            if (elapsedMs < maxRouteLabelAnalysisMs) {
+                scheduleModalVisibilityFallback(attemptId)
+            } else {
+                resetTripDetailFlow("modal_fallback_expired elapsedMs=$elapsedMs")
+            }
+        }, modalFallbackCheckIntervalMs)
     }
 
     private fun requestRouteLabelScreenshotWhenOverlaysGone(reason: String, requiredOverlayGeneration: Long) {
@@ -571,9 +633,24 @@ class ScraperAccessibilityService : AccessibilityService() {
         context: TripFlowContext?,
         result: RouteLabelOcr.OcrResult
     ) {
-        if (isContextStale(context) || routeLabelOcrRetryCount >= 2) {
+        val analysisElapsedMs = context
+            ?.let { timingFor(it.attemptId).cardClickedAt }
+            ?.takeIf { it > 0L }
+            ?.let { nowMs() - it }
+            ?: 0L
+        val modalVisible = isTripDetailModalCurrentlyVisible()
+
+        if (
+            isContextStale(context) ||
+            !modalVisible ||
+            routeLabelOcrRetryCount >= maxOcrIncompleteRetries ||
+            analysisElapsedMs >= maxRouteLabelAnalysisMs
+        ) {
             logFlowIncomplete("ocr_parse_incomplete", context)
-            resetTripDetailFlow("ocr_parse_incomplete_after_retries retries=$routeLabelOcrRetryCount")
+            resetTripDetailFlow(
+                "ocr_parse_incomplete_after_retries retries=$routeLabelOcrRetryCount " +
+                    "elapsedMs=$analysisElapsedMs modalVisible=$modalVisible"
+            )
             return
         }
 
@@ -728,13 +805,14 @@ class ScraperAccessibilityService : AccessibilityService() {
     }
 
     private fun isTripDetailModalVisible(rootNode: AccessibilityNodeInfo): Boolean {
-        return hasNodeById(rootNode, "sinet.startup.inDriver:id/design_bottom_sheet") &&
-            hasNodeById(rootNode, "sinet.startup.inDriver:id/button_offer") &&
-            hasNodeById(rootNode, "sinet.startup.inDriver:id/order_info_header_text_price") &&
-            (
-                hasNodeById(rootNode, "sinet.startup.inDriver:id/order_info_header_text_distance") ||
-                    hasNodeByText(rootNode, "Solicitud de viaje")
-                )
+        val hasDetailHeader = hasNodeByText(rootNode, "Solicitud de viaje") ||
+            hasNodeById(rootNode, "sinet.startup.inDriver:id/button_offer")
+        val hasDetailTripData = hasNodeById(rootNode, "sinet.startup.inDriver:id/order_info_header_text_price") ||
+            hasNodeById(rootNode, "sinet.startup.inDriver:id/order_info_header_text_distance") ||
+            hasNodeById(rootNode, "sinet.startup.inDriver:id/order_info_address_text_pickup") ||
+            hasNodeById(rootNode, "sinet.startup.inDriver:id/order_info_address_text_destination")
+
+        return hasDetailHeader && hasDetailTripData
     }
 
     private fun isTripListVisible(rootNode: AccessibilityNodeInfo): Boolean {
