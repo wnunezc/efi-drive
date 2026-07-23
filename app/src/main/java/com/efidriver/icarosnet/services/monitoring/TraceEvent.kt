@@ -1,0 +1,21 @@
+package com.efidriver.icarosnet.services.monitoring
+
+object TraceEvent {
+    const val TRIP_FIRST_SEEN = "TRIP_FIRST_SEEN"
+    const val OVERLAY_ADDED = "OVERLAY_ADDED"
+    const val OVERLAY_UPDATED = "OVERLAY_UPDATED"
+    const val OVERLAY_REMOVED = "OVERLAY_REMOVED"
+    const val TRIP_CLICKED = "TRIP_CLICKED"
+    const val LIST_SCAN_END = "LIST_SCAN_END"
+    const val PREVIEW_HIDE_REQUEST = "PREVIEW_HIDE_REQUEST"
+    const val CARD_CLEANUP_REQUEST = "CARD_CLEANUP_REQUEST"
+    const val LIST_OVERLAY_CLEAR_START = "LIST_OVERLAY_CLEAR_START"
+    const val LIST_OVERLAYS_CLEARED = "LIST_OVERLAYS_CLEARED"
+    const val LIST_OVERLAY_CLEAR_END = "LIST_OVERLAY_CLEAR_END"
+    const val MODAL_RENDERED = "MODAL_RENDERED"
+    const val MAP_CHANGED = "MAP_CHANGED"
+    const val OCR_STARTED = "OCR_STARTED"
+    const val OCR_DONE = "OCR_DONE"
+    const val DETAIL_OVERLAY_SHOWN = "DETAIL_OVERLAY_SHOWN"
+    const val FLOW_RESET = "FLOW_RESET"
+}
