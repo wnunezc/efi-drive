@@ -28,11 +28,12 @@ object ProfitabilityEngine {
         
         // 4. GANANCIA REAL (Neto - (Distancia * Umbral))
         val operatingCost = totalDistanceKm * minUsdPerKm
-        val trueProfit = round((expectedIncome - operatingCost) * 100.0) / 100.0
+        val rawTrueProfit = expectedIncome - operatingCost
+        val trueProfit = round(rawTrueProfit * 100.0) / 100.0
         
         // 5. Verificación de Filtros
         val pickupAccepted = pickupDistanceKm <= maxPickupDistanceKm
-        val tripAcceptedByPrice = expectedUsdPerKm >= minUsdPerKm
+        val tripAcceptedByPrice = trueProfit >= 0.0
         
         val status = when {
             !pickupAccepted -> TripStatus.NOT_RENTABLE_PICKUP

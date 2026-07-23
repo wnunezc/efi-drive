@@ -36,7 +36,7 @@ object RouteLabelDetector {
             0,
             (bitmap.height * 0.08).toInt(),
             bitmap.width,
-            (bitmap.height * 0.56).toInt()
+            (bitmap.height * 0.62).toInt()
         )
         val sampledWidth = roi.width() / sample
         val sampledHeight = roi.height() / sample
@@ -106,7 +106,7 @@ object RouteLabelDetector {
             0,
             (bitmap.height * 0.08).toInt(),
             bitmap.width,
-            (bitmap.height * 0.56).toInt()
+            (bitmap.height * 0.62).toInt()
         )
         val width = roi.width()
         val height = roi.height()
@@ -200,10 +200,10 @@ object RouteLabelDetector {
         val queue = IntArray(mask.matches.size)
         val candidates = mutableListOf<LabelCandidate>()
         val minPixels = 1_200 / (sample * sample)
-        val minWidth = 70 / sample
-        val maxWidth = 280 / sample
-        val minHeight = 45 / sample
-        val maxHeight = 170 / sample
+        val minWidth = 58 / sample
+        val maxWidth = 330 / sample
+        val minHeight = 38 / sample
+        val maxHeight = 190 / sample
         val padX = (10 / sample).coerceAtLeast(2)
         val padY = (10 / sample).coerceAtLeast(2)
         val padRight = (11 / sample).coerceAtLeast(3)
@@ -221,7 +221,7 @@ object RouteLabelDetector {
             val density = component.pixels.toDouble() / area.toDouble()
             if (
                 component.pixels >= minPixels &&
-                density >= 0.35 &&
+                density >= 0.30 &&
                 boundsWidth in minWidth..maxWidth &&
                 boundsHeight in minHeight..maxHeight
             ) {
@@ -298,10 +298,10 @@ object RouteLabelDetector {
     private fun findBySlidingWindow(mask: ColorMask, roi: Rect, sample: Int = 1): List<LabelCandidate> {
         val integral = buildIntegralMask(mask)
         val rawCandidates = mutableListOf<LabelCandidate>()
-        val widths = intArrayOf(100, 130, 160, 190, 220, 250).map { (it / sample).coerceAtLeast(20) }
-        val heights = intArrayOf(64, 82, 100, 118, 136).map { (it / sample).coerceAtLeast(16) }
+        val widths = intArrayOf(84, 110, 140, 170, 205, 240, 280, 320).map { (it / sample).coerceAtLeast(20) }
+        val heights = intArrayOf(52, 68, 84, 104, 124, 148, 172).map { (it / sample).coerceAtLeast(16) }
         val step = (12 / sample).coerceAtLeast(4)
-        val minColored = (1_400 / (sample * sample)).coerceAtLeast(120)
+        val minColored = (1_000 / (sample * sample)).coerceAtLeast(90)
         val padX = (18 / sample).coerceAtLeast(4)
         val padY = (14 / sample).coerceAtLeast(4)
 
@@ -315,7 +315,7 @@ object RouteLabelDetector {
                     while (x + width <= mask.width) {
                         val colored = sum(integral, mask.width, x, y, width, height)
                         val density = colored.toDouble() / (width * height).toDouble()
-                        if (colored >= minColored && density >= 0.28) {
+                        if (colored >= minColored && density >= 0.22) {
                             val bounds = Rect(
                                 roi.left + x - padX,
                                 roi.top + y - padY,
@@ -386,10 +386,18 @@ object RouteLabelDetector {
     }
 
     private fun isPickupBlue(red: Int, green: Int, blue: Int): Boolean {
-        return blue >= 150 && green >= 95 && red <= 115 && blue - red >= 70
+        return blue >= 135 &&
+            green >= 80 &&
+            red <= 135 &&
+            blue - red >= 45 &&
+            blue >= green + 20
     }
 
     private fun isDestinationGreen(red: Int, green: Int, blue: Int): Boolean {
-        return green >= 115 && red <= 95 && blue <= 115 && green - red >= 50
+        return green >= 105 &&
+            red <= 125 &&
+            blue <= 135 &&
+            green - red >= 35 &&
+            green >= blue + 20
     }
 }

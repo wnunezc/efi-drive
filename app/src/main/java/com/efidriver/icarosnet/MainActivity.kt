@@ -11,7 +11,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Scaffold
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import com.efidriver.icarosnet.license.AppLicenseManager
 import com.efidriver.icarosnet.ui.screens.ConfigScreen
+import com.efidriver.icarosnet.ui.screens.LicenseScreen
 import com.efidriver.icarosnet.ui.screens.PermissionsScreen
 import com.efidriver.icarosnet.ui.screens.isAccessibilityServiceEnabled
 import com.efidriver.icarosnet.services.ScraperAccessibilityService
@@ -23,6 +25,8 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent {
             EfidriverTheme {
+                val licenseManager = remember { AppLicenseManager(this) }
+                var licenseReady by remember { mutableStateOf(licenseManager.hasUsableLicense()) }
                 var permissionsGranted by remember { 
                     mutableStateOf(
                         Settings.canDrawOverlays(this) && 
@@ -34,6 +38,7 @@ class MainActivity : ComponentActivity() {
                 DisposableEffect(Unit) {
                     val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
                         if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                            licenseReady = licenseManager.hasUsableLicense()
                             permissionsGranted = Settings.canDrawOverlays(this@MainActivity) && 
                                 isAccessibilityServiceEnabled(this@MainActivity, ScraperAccessibilityService::class.java)
                         }
@@ -46,7 +51,11 @@ class MainActivity : ComponentActivity() {
 
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     Box(modifier = Modifier.padding(innerPadding)) {
-                        if (!permissionsGranted) {
+                        if (!licenseReady) {
+                            LicenseScreen(onLicenseReady = {
+                                licenseReady = true
+                            })
+                        } else if (!permissionsGranted) {
                             PermissionsScreen(onAllPermissionsGranted = {
                                 permissionsGranted = true
                             })

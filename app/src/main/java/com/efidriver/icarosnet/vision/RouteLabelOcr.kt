@@ -161,6 +161,19 @@ object RouteLabelOcr {
         val metrics: LabelMetrics
     )
 
+    private data class CropVariant(
+        val paddingX: Int,
+        val paddingY: Int,
+        val scale: Int,
+        val whiteThreshold: Int
+    )
+
+    private val cropVariants = listOf(
+        CropVariant(paddingX = 18, paddingY = 12, scale = 3, whiteThreshold = 210),
+        CropVariant(paddingX = 28, paddingY = 18, scale = 3, whiteThreshold = 200),
+        CropVariant(paddingX = 36, paddingY = 24, scale = 4, whiteThreshold = 195)
+    )
+
     private fun findCompleteCandidate(
         source: Bitmap,
         candidates: List<RouteLabelDetector.LabelCandidate>,
@@ -204,25 +217,51 @@ object RouteLabelOcr {
         onSuccess: (LabelMetrics) -> Unit,
         onFailure: (Exception) -> Unit
     ) {
-        val bitmap = cropForOcr(source, bounds)
+        var bestMetrics: LabelMetrics? = null
+        var lastFailure: Exception? = null
+
+        fun tryVariant(index: Int) {
+            if (index >= cropVariants.size) {
+                val best = bestMetrics
+                if (best != null) {
+                    onSuccess(best)
+                } else {
+                    onFailure(lastFailure ?: IllegalStateException("ocr_crop_variants_failed"))
+                }
+                return
+            }
+
+            val bitmap = cropForOcr(source, bounds, cropVariants[index])
         recognizer.process(InputImage.fromBitmap(bitmap, 0))
             .addOnSuccessListener { text ->
                 bitmap.recycle()
-                onSuccess(parseLabelMetrics(text.text))
+                    val metrics = parseLabelMetrics(text.text)
+                    if (metrics.score > (bestMetrics?.score ?: -1)) {
+                        bestMetrics = metrics
+                    }
+                    if (metrics.complete) {
+                        onSuccess(metrics)
+                    } else {
+                        tryVariant(index + 1)
+                    }
             }
             .addOnFailureListener { exception ->
                 bitmap.recycle()
-                onFailure(exception)
+                    lastFailure = exception
+                    tryVariant(index + 1)
             }
+        }
+
+        tryVariant(0)
     }
 
-    private fun cropForOcr(source: Bitmap, bounds: Rect): Bitmap {
+    private fun cropForOcr(source: Bitmap, bounds: Rect, variant: CropVariant): Bitmap {
         val expanded = Rect(bounds)
-        expanded.inset(-18, -12)
+        expanded.inset(-variant.paddingX, -variant.paddingY)
         expanded.intersect(0, 0, source.width, source.height)
 
         val crop = Bitmap.createBitmap(source, expanded.left, expanded.top, expanded.width(), expanded.height())
-        val scaled = Bitmap.createScaledBitmap(crop, crop.width * 3, crop.height * 3, false)
+        val scaled = Bitmap.createScaledBitmap(crop, crop.width * variant.scale, crop.height * variant.scale, false)
         crop.recycle()
 
         val output = Bitmap.createBitmap(scaled.width, scaled.height, Bitmap.Config.ARGB_8888)
@@ -233,7 +272,9 @@ object RouteLabelOcr {
             val red = Color.red(color)
             val green = Color.green(color)
             val blue = Color.blue(color)
-            val isWhiteText = red >= 210 && green >= 210 && blue >= 210
+            val isWhiteText = red >= variant.whiteThreshold &&
+                green >= variant.whiteThreshold &&
+                blue >= variant.whiteThreshold
             pixels[index] = if (isWhiteText) Color.BLACK else Color.WHITE
         }
         output.setPixels(pixels, 0, scaled.width, 0, 0, scaled.width, scaled.height)
@@ -248,12 +289,14 @@ object RouteLabelOcr {
             .replace("í", "i")
             .replace("ı", "i")
             .replace("rn", "m")
+            .replace("mim", "min")
+            .replace("nin", "min")
             .replace(Regex("\\bk\\s*m\\b"), "km")
             .replace(Regex("\\bk\\s*mn\\b"), "kmn")
             .replace(Regex("\\s+"), " ")
             .trim()
 
-        val minutes = Regex("""(\d{1,3})\s*m(?:in)?""")
+        val minutes = Regex("""(\d{1,3})\s*(?:min|mn|mim|m)\b""")
             .find(normalized)
             ?.groupValues
             ?.getOrNull(1)
@@ -295,11 +338,27 @@ object RouteLabelOcr {
             else -> distanceKm
         }
 
+        val fallbackDistanceKm = plausibleDistanceKm ?: parseUnitlessDistanceKm(normalized, minutes)
+
         return LabelMetrics(
             minutes = minutes,
-            distanceKm = plausibleDistanceKm,
+            distanceKm = fallbackDistanceKm,
             rawText = rawText.replace('\n', '|')
         )
+    }
+
+    private val LabelMetrics.score: Int
+        get() = (if (minutes != null) 1 else 0) + (if (distanceKm != null) 1 else 0)
+
+    private fun parseUnitlessDistanceKm(normalized: String, minutes: Int?): Double? {
+        if (minutes == null) return null
+        val numbers = Regex("""\d{1,4}(?:[,.]\d{1,2})?""")
+            .findAll(normalized)
+            .mapNotNull { it.value.replace(',', '.').toDoubleOrNull() }
+            .toList()
+        val decimalDistance = numbers
+            .firstOrNull { value -> value != minutes.toDouble() && value > 0.0 && value <= 80.0 && value % 1.0 != 0.0 }
+        return decimalDistance?.takeIf { it / minutes <= MAX_PLAUSIBLE_KM_PER_MINUTE }
     }
 
     private fun String?.isMeterUnit(): Boolean =

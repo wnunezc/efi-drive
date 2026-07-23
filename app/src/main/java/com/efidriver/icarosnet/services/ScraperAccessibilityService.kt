@@ -23,6 +23,7 @@ import android.widget.TextView
 import com.efidriver.icarosnet.engine.TripEvaluationCache
 import com.efidriver.icarosnet.engine.TripEvaluationKind
 import com.efidriver.icarosnet.engine.TripEvaluationSnapshot
+import com.efidriver.icarosnet.license.AppLicenseManager
 import com.efidriver.icarosnet.vision.RouteLabelDetector
 import com.efidriver.icarosnet.vision.RouteLabelOcr
 import com.efidriver.icarosnet.models.Trip
@@ -33,19 +34,23 @@ import com.efidriver.icarosnet.models.ProfitabilityResult
 import com.efidriver.icarosnet.engine.SettingsManager
 import java.util.concurrent.Executors
 import kotlin.math.max
+import kotlin.math.min
 
 @SuppressLint("AccessibilityPolicy")
 class ScraperAccessibilityService : AccessibilityService() {
 
     private lateinit var settingsManager: SettingsManager
+    private lateinit var licenseManager: AppLicenseManager
     private lateinit var windowManager: WindowManager
     private val TAG_HUD = "EfiHUD"
     private val TAG_SONDA = "EfiSonda"
     private val TAG_FLOW = "EfiTripFlow"
+    private val TAG_CLEANUP_TRACE = "EfiCleanupTrace"
     private val screenshotExecutor = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
     
     private val activeOverlays = mutableMapOf<String, OverlayRecord>()
+    private val overlayMissingScanCounts = mutableMapOf<String, Int>()
     private var detailProfitabilityOverlay: View? = null
 
     private enum class DetailFlowStage {
@@ -63,11 +68,17 @@ class ScraperAccessibilityService : AccessibilityService() {
         val pickupDistanceText: String,
         val priceText: String,
         val pickupAddress: String,
-        val destinationAddress: String
+        val destinationAddress: String,
+        val offerPriceTexts: List<String> = emptyList()
     ) {
         val identity: TripIdentity = TripIdentity.from(passengerName, pickupAddress, destinationAddress)
         val fingerprint: String = identity.bestKey
     }
+
+    private data class OfferRecommendation(
+        val price: Double,
+        val profitability: ProfitabilityResult
+    )
 
     private data class TripFlowContext(
         val attemptId: Long,
@@ -110,12 +121,17 @@ class ScraperAccessibilityService : AccessibilityService() {
     private var routeLabelOcrRetryCount = 0
     private var overlayClearGeneration = 0L
     private var listOverlayRenderingBlocked = false
+    private var licenseBlockedActive = false
+    private var lastCardClickForCleanupAt = 0L
     private var listWithoutModalEventCount = 0
     private val flowTimings = mutableMapOf<Long, FlowTiming>()
     private val tripEvaluationCache = TripEvaluationCache()
     private val maxOcrIncompleteRetries = 6
     private val maxRouteLabelAnalysisMs = 10_000L
     private val modalFallbackCheckIntervalMs = 250L
+    private val postDetailListRefreshAttempts = 30
+    private val postDetailListRefreshIntervalMs = 100L
+    private val staleOverlayRemovalConfirmations = 3
 
     private data class OverlayRecord(
         val view: View,
@@ -126,6 +142,7 @@ class ScraperAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         settingsManager = SettingsManager(this)
+        licenseManager = AppLicenseManager(this)
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         Log.d(TAG_HUD, "--- SERVICIO ESTABLE v7.2 - HUD PROTEGIDO ---")
     }
@@ -135,12 +152,15 @@ class ScraperAccessibilityService : AccessibilityService() {
         val packageName = event?.packageName?.toString() ?: ""
         
         if (packageName == "sinet.startup.inDriver") {
+            if (!isLicenseAllowedForService()) {
+                return
+            }
             observeTripDetailFlow(event)
             val afterObserveAt = nowMs()
 
             // 1. HUD Y FILTRO (Producci??n)
             if (isTripDetailFlowActive() || listOverlayRenderingBlocked) {
-                clearAllOverlays()
+                clearAllOverlays("indriver_event_detail_flow_blocked")
             } else {
                 processMainFlow()
             }
@@ -174,13 +194,29 @@ class ScraperAccessibilityService : AccessibilityService() {
             }
         } else {
             if (event?.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-                if (packageName != "com.efidriver.icarosnet") {
-                    resetTripDetailFlow("external_package=$packageName")
-                    clearAllOverlays()
+                    if (packageName != "com.efidriver.icarosnet") {
+                        resetTripDetailFlow("external_package=$packageName")
+                    clearAllOverlays("external_package=$packageName")
                     removeDetailProfitabilityOverlay()
                 }
             }
         }
+    }
+
+    private fun isLicenseAllowedForService(): Boolean {
+        if (!::licenseManager.isInitialized || licenseManager.hasUsableLicense()) {
+            licenseBlockedActive = false
+            return true
+        }
+
+        if (!licenseBlockedActive) {
+            licenseBlockedActive = true
+            Log.w(TAG_HUD, "LICENSE_BLOCKED overlays=${activeOverlays.size} detailOverlay=${detailProfitabilityOverlay != null}")
+            clearAllOverlays("license_not_valid")
+            removeDetailProfitabilityOverlay()
+            resetTripDetailFlow("license_not_valid")
+        }
+        return false
     }
 
     private fun observeTripDetailFlow(event: AccessibilityEvent?) {
@@ -198,10 +234,16 @@ class ScraperAccessibilityService : AccessibilityService() {
                 pendingTripClick = tripClick
                 activeFlowContext = TripFlowContext(detailFlowAttempt, tripClick)
                 timingFor(detailFlowAttempt).cardClickedAt = nowMs()
+                lastCardClickForCleanupAt = nowMs()
                 detailFlowStage = DetailFlowStage.CARD_CLICKED
                 listOverlayRenderingBlocked = true
                 listWithoutModalEventCount = 0
-                clearAllOverlays()
+                Log.d(
+                    TAG_CLEANUP_TRACE,
+                    "TEMP_CARD_CLICK attempt=$detailFlowAttempt activeBefore=${activeOverlays.size} " +
+                        "fp=${tripClick.fingerprint} price=${tripClick.priceText}"
+                )
+                clearAllOverlays("card_clicked_opening_detail")
                 removeDetailProfitabilityOverlay()
                 lastScreenshotReason = "none"
                 lastModalSummary = "none"
@@ -218,6 +260,7 @@ class ScraperAccessibilityService : AccessibilityService() {
                 if (!isDebugDiagnosticsEnabled()) {
                     Log.d(TAG_FLOW, "CARD_CLICKED attempt=$detailFlowAttempt price=${tripClick.priceText} pickup=${tripClick.pickupDistanceText}")
                 }
+                startRouteLabelMonitor("card_click_visual_probe")
                 scheduleModalVisibilityFallback(detailFlowAttempt)
             }
 
@@ -255,7 +298,9 @@ class ScraperAccessibilityService : AccessibilityService() {
 
                 if (detailFlowStage != DetailFlowStage.IDLE && isTripListVisible(rootNode) && !isTripDetailModalVisible(rootNode)) {
                     listWithoutModalEventCount += 1
-                    clearAllOverlays()
+                    if (!shouldResetDetailFlowFromTripListOnly()) {
+                        clearAllOverlays("list_visible_while_detail_flow_pending")
+                    }
                     if (shouldResetDetailFlowFromTripListOnly()) {
                         resetTripDetailFlow("trip_list_visible_without_modal events=$listWithoutModalEventCount")
                     } else {
@@ -267,6 +312,7 @@ class ScraperAccessibilityService : AccessibilityService() {
                 if (detailFlowStage == DetailFlowStage.CARD_CLICKED && isTripDetailModalVisible(rootNode)) {
                     listWithoutModalEventCount = 0
                     val modalTrip = extractModalTrip(rootNode)
+                    enrichActiveFlowWithModalTrip(modalTrip)
                     lastModalSummary = "visible=true modal=${modalTrip?.fingerprint ?: "unknown"} " +
                         "matches=${modalTrip?.fingerprint == pendingTripClick?.fingerprint}"
                     detailFlowStage = DetailFlowStage.MODAL_RENDERED
@@ -330,18 +376,40 @@ class ScraperAccessibilityService : AccessibilityService() {
     private fun shouldResetDetailFlowFromTripListOnly(): Boolean {
         return when (detailFlowStage) {
             DetailFlowStage.IDLE -> false
-            DetailFlowStage.CARD_CLICKED -> listWithoutModalEventCount >= 3
+            DetailFlowStage.CARD_CLICKED -> {
+                if (routeLabelMonitorActive) {
+                    activeFlowElapsedMs() >= maxRouteLabelAnalysisMs
+                } else {
+                    listWithoutModalEventCount >= 3
+                }
+            }
             DetailFlowStage.OCR_COMPLETED -> true
             DetailFlowStage.MODAL_RENDERED,
             DetailFlowStage.DETAIL_CONTENT_CHANGED,
             DetailFlowStage.MAP_CHANGED -> false
-            DetailFlowStage.OCR_REQUESTED -> routeLabelOcrRetryCount > 0 || listWithoutModalEventCount >= 3
+            DetailFlowStage.OCR_REQUESTED -> {
+                activeFlowElapsedMs() >= maxRouteLabelAnalysisMs ||
+                    (routeLabelOcrRetryCount > 0 && isTripListVisibleWithoutDetailModal())
+            }
         }
+    }
+
+    private fun activeFlowElapsedMs(): Long {
+        val attemptId = activeFlowContext?.attemptId ?: return 0L
+        return timingFor(attemptId).cardClickedAt
+            .takeIf { it > 0L }
+            ?.let { nowMs() - it }
+            ?: 0L
     }
 
     private fun isTripDetailModalCurrentlyVisible(): Boolean {
         val rootNode = rootInActiveWindow ?: return false
         return isTripDetailModalVisible(rootNode)
+    }
+
+    private fun isTripListVisibleWithoutDetailModal(): Boolean {
+        val rootNode = rootInActiveWindow ?: return false
+        return isTripListVisible(rootNode) && !isTripDetailModalVisible(rootNode)
     }
 
     private fun startRouteLabelMonitor(reason: String) {
@@ -383,6 +451,7 @@ class ScraperAccessibilityService : AccessibilityService() {
             if (isTripDetailModalVisible(rootNode)) {
                 listWithoutModalEventCount = 0
                 val modalTrip = extractModalTrip(rootNode)
+                enrichActiveFlowWithModalTrip(modalTrip)
                 lastModalSummary = "visible=true modal=${modalTrip?.fingerprint ?: "unknown"} " +
                     "matches=${modalTrip?.fingerprint == pendingTripClick?.fingerprint}"
                 detailFlowStage = DetailFlowStage.MODAL_RENDERED
@@ -401,7 +470,9 @@ class ScraperAccessibilityService : AccessibilityService() {
 
             if (isTripListVisible(rootNode)) {
                 listWithoutModalEventCount += 1
-                if (shouldResetDetailFlowFromTripListOnly() || elapsedMs >= maxRouteLabelAnalysisMs) {
+                if (routeLabelMonitorActive && elapsedMs < maxRouteLabelAnalysisMs) {
+                    scheduleModalVisibilityFallback(attemptId)
+                } else if (shouldResetDetailFlowFromTripListOnly() || elapsedMs >= maxRouteLabelAnalysisMs) {
                     resetTripDetailFlow("modal_not_opened_after_click elapsedMs=$elapsedMs events=$listWithoutModalEventCount")
                 } else {
                     scheduleModalVisibilityFallback(attemptId)
@@ -528,13 +599,6 @@ class ScraperAccessibilityService : AccessibilityService() {
                                     detailFlowStage = DetailFlowStage.MAP_CHANGED
                                 }
                                 logFlowDebug { "ROUTE_LABELS_VISIBLE ${flowContextLog(context)} afterFlowReset=${isContextStale(context)}" }
-                                if (!isContextStale(context)) {
-                                    mainHandler.post {
-                                        if (!isContextStale(context)) {
-                                            showDetailProgressOverlay()
-                                        }
-                                    }
-                                }
                                 bitmapOwnedByOcr = true
                                 requestRouteLabelOcr(bitmap, result, context)
                             } else {
@@ -608,7 +672,11 @@ class ScraperAccessibilityService : AccessibilityService() {
                             if (!isTripDetailModalCurrentlyVisible()) {
                                 logFlowWaiting("modal_tree_unavailable_at_ocr_complete_showing_overlay_from_active_context", context)
                             }
-                            showDetailProfitabilityOverlay(profitability, result)
+                            showDetailProfitabilityOverlay(
+                                profitability,
+                                result,
+                                findOfferRecommendation(context, result, profitability)
+                            )
                         }
                     }
                     logFlowDebug {
@@ -639,17 +707,25 @@ class ScraperAccessibilityService : AccessibilityService() {
             ?.let { nowMs() - it }
             ?: 0L
         val modalVisible = isTripDetailModalCurrentlyVisible()
+        val listVisibleWithoutModal = isTripListVisibleWithoutDetailModal()
 
         if (
             isContextStale(context) ||
-            !modalVisible ||
+            (!modalVisible && listVisibleWithoutModal) ||
             routeLabelOcrRetryCount >= maxOcrIncompleteRetries ||
             analysisElapsedMs >= maxRouteLabelAnalysisMs
         ) {
-            logFlowIncomplete("ocr_parse_incomplete", context)
+            logFlowIncomplete(
+                "ocr_parse_incomplete retries=$routeLabelOcrRetryCount elapsedMs=$analysisElapsedMs " +
+                    "pickupComplete=${result.pickup.complete} pickupRaw=${result.pickup.rawText} " +
+                    "pickupMin=${result.pickup.minutes} pickupKm=${result.pickup.distanceKm} " +
+                    "destinationComplete=${result.destination.complete} destinationRaw=${result.destination.rawText} " +
+                    "destinationMin=${result.destination.minutes} destinationKm=${result.destination.distanceKm}",
+                context
+            )
             resetTripDetailFlow(
                 "ocr_parse_incomplete_after_retries retries=$routeLabelOcrRetryCount " +
-                    "elapsedMs=$analysisElapsedMs modalVisible=$modalVisible"
+                    "elapsedMs=$analysisElapsedMs modalVisible=$modalVisible listVisibleWithoutModal=$listVisibleWithoutModal"
             )
             return
         }
@@ -709,18 +785,57 @@ class ScraperAccessibilityService : AccessibilityService() {
         )
     }
 
+    private fun findOfferRecommendation(
+        context: TripFlowContext?,
+        ocrResult: RouteLabelOcr.OcrResult,
+        currentProfitability: ProfitabilityResult
+    ): OfferRecommendation? {
+        if (currentProfitability.status == TripStatus.RENTABLE) return null
+
+        val trip = context?.trip ?: return null
+        val basePrice = parsePriceText(trip.priceText) ?: return null
+        val pickupDistanceKm = ocrResult.pickup.distanceKm ?: return null
+        val tripDistanceKm = ocrResult.destination.distanceKm ?: return null
+        val visibleOfferPriceTexts = rootInActiveWindow
+            ?.takeIf { isTripDetailModalVisible(it) }
+            ?.let { extractOfferPriceTexts(it, trip.priceText) }
+            .orEmpty()
+
+        return (trip.offerPriceTexts + visibleOfferPriceTexts)
+            .mapNotNull(::parsePriceText)
+            .filter { it > basePrice + 0.001 }
+            .distinct()
+            .sorted()
+            .firstNotNullOfOrNull { offerPrice ->
+                val offerProfitability = ProfitabilityEngine.calculate(
+                    tripPrice = offerPrice,
+                    pickupDistanceKm = pickupDistanceKm,
+                    tripDistanceKm = tripDistanceKm,
+                    maxPickupDistanceKm = settingsManager.maxPickupDistance,
+                    minUsdPerKm = settingsManager.minUsdPerKm,
+                    commissionPercent = settingsManager.commissionPercent,
+                    isPreview = false
+                )
+                if (offerProfitability.status == TripStatus.RENTABLE) {
+                    OfferRecommendation(offerPrice, offerProfitability)
+                } else {
+                    null
+                }
+            }
+    }
+
     private fun parsePriceText(priceText: String): Double? {
-        return priceText
-            .replace("$", "")
-            .replace(",", ".")
-            .trim()
-            .toDoubleOrNull()
+        return Regex("""\d+(?:[,.]\d+)?""")
+            .find(priceText)
+            ?.value
+            ?.replace(",", ".")
+            ?.toDoubleOrNull()
     }
 
     private fun scheduleRouteLabelRescan(reason: String) {
         if (!routeLabelMonitorActive) return
         routeLabelAwaitingMapEventRescan = true
-        logFlowDebug { "ROUTE_LABEL_RESCAN_WAITING_FOR_MAP_EVENT ${flowContextLog()} reason=$reason" }
+        logFlowDebug { "ROUTE_LABEL_RESCAN_SCHEDULED ${flowContextLog()} reason=$reason" }
         mainHandler.postDelayed({
             if (!routeLabelMonitorActive) return@postDelayed
             if (!routeLabelAwaitingMapEventRescan) return@postDelayed
@@ -732,7 +847,12 @@ class ScraperAccessibilityService : AccessibilityService() {
                 return@postDelayed
             }
 
-            if (isTripListVisible(rootNode) && !hasNodeByText(rootNode, "Solicitud de viaje")) {
+            val elapsedMs = activeFlowElapsedMs()
+            if (
+                elapsedMs >= maxRouteLabelAnalysisMs &&
+                isTripListVisible(rootNode) &&
+                !isTripDetailModalVisible(rootNode)
+            ) {
                 resetTripDetailFlow("trip_list_returned_before_route_labels_visible reason=$reason")
                 return@postDelayed
             }
@@ -755,6 +875,11 @@ class ScraperAccessibilityService : AccessibilityService() {
     }
 
     private fun extractClickedTrip(event: AccessibilityEvent): PendingTripClick? {
+        if (isTripClickFromIgnoredSurface(event.source)) {
+            logFlowDebug { "CARD_CLICK_IGNORED ignoredSurface event=${describeFlowEvent(event)}" }
+            return null
+        }
+
         val texts = event.text.map { it.toString().trim() }.filter { it.isNotEmpty() }
         val joined = texts.joinToString("|")
         if (!joined.contains("$")) return null
@@ -788,20 +913,83 @@ class ScraperAccessibilityService : AccessibilityService() {
         )
     }
 
+    private fun enrichActiveFlowWithModalTrip(modalTrip: PendingTripClick?) {
+        val currentContext = activeFlowContext ?: return
+        val trip = modalTrip ?: return
+        if (trip.fingerprint != currentContext.fingerprint) return
+
+        pendingTripClick = trip
+        activeFlowContext = currentContext.copy(trip = trip)
+        logFlowDebug {
+            "MODAL_TRIP_ENRICHED ${flowContextLog(activeFlowContext)} offers=${trip.offerPriceTexts.joinToString("|")}"
+        }
+    }
+
+    private fun isTripClickFromIgnoredSurface(source: AccessibilityNodeInfo?): Boolean {
+        var current = source
+        var depth = 0
+        while (current != null && depth < 8) {
+            val viewId = current.viewIdResourceName.orEmpty()
+            if (
+                viewId.endsWith("driver_common_imageview_avatar") ||
+                viewId.endsWith("item_order_userinfoview") ||
+                viewId.endsWith("item_order_imageview_dots") ||
+                viewId.endsWith("item_order_options_container_hide")
+            ) {
+                return true
+            }
+            if (
+                viewId.endsWith("item_order_container_info") ||
+                viewId.endsWith("info_textview_stage_price_view") ||
+                viewId.endsWith("order_info_textview_from_address") ||
+                viewId.endsWith("order_info_textview_to_address") ||
+                viewId.endsWith("order_info_textview_to_addresses")
+            ) {
+                return false
+            }
+            current = current.parent
+            depth += 1
+        }
+        return false
+    }
+
     private fun extractModalTrip(rootNode: AccessibilityNodeInfo): PendingTripClick? {
         val passengerName = findTextById(rootNode, "sinet.startup.inDriver:id/user_info_text_name") ?: return null
         val pickupDistanceText = findTextById(rootNode, "sinet.startup.inDriver:id/order_info_header_text_distance") ?: return null
         val priceText = findTextById(rootNode, "sinet.startup.inDriver:id/order_info_header_text_price") ?: return null
         val pickupAddress = findTextById(rootNode, "sinet.startup.inDriver:id/order_info_address_text_pickup") ?: return null
         val destinationAddress = findTextById(rootNode, "sinet.startup.inDriver:id/order_info_address_text_destination") ?: return null
+        val offerPriceTexts = extractOfferPriceTexts(rootNode, priceText)
 
         return PendingTripClick(
             passengerName = passengerName,
             pickupDistanceText = pickupDistanceText,
             priceText = priceText,
             pickupAddress = pickupAddress,
-            destinationAddress = destinationAddress
+            destinationAddress = destinationAddress,
+            offerPriceTexts = offerPriceTexts
         )
+    }
+
+    private fun extractOfferPriceTexts(rootNode: AccessibilityNodeInfo, basePriceText: String): List<String> {
+        val basePrice = parsePriceText(basePriceText) ?: return emptyList()
+        return collectNodeTexts(rootNode)
+            .filter { it.contains("$") }
+            .mapNotNull { text ->
+                val price = parsePriceText(text) ?: return@mapNotNull null
+                if (price > basePrice + 0.001) text else null
+            }
+            .distinctBy { parsePriceText(it) }
+    }
+
+    private fun collectNodeTexts(node: AccessibilityNodeInfo?): List<String> {
+        if (node == null) return emptyList()
+        val texts = mutableListOf<String>()
+        node.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let(texts::add)
+        for (index in 0 until node.childCount) {
+            texts.addAll(collectNodeTexts(node.getChild(index)))
+        }
+        return texts
     }
 
     private fun isTripDetailModalVisible(rootNode: AccessibilityNodeInfo): Boolean {
@@ -817,6 +1005,18 @@ class ScraperAccessibilityService : AccessibilityService() {
 
     private fun isTripListVisible(rootNode: AccessibilityNodeInfo): Boolean {
         return rootNode.findAccessibilityNodeInfosByViewId("sinet.startup.inDriver:id/item_order_container").isNotEmpty()
+    }
+
+    private fun isTripSearchEmptyStateVisible(rootNode: AccessibilityNodeInfo): Boolean {
+        return hasNodeByText(rootNode, "Buscando en un área más amplia") ||
+            hasNodeByText(rootNode, "Buscando en un area mas amplia") ||
+            collectNodeTexts(rootNode).any { text ->
+                text.contains("Buscando en un", ignoreCase = true) &&
+                    (
+                        text.contains("área", ignoreCase = true) ||
+                            text.contains("area", ignoreCase = true)
+                    )
+            }
     }
 
     private fun isGoogleMapEvent(event: AccessibilityEvent): Boolean {
@@ -847,6 +1047,7 @@ class ScraperAccessibilityService : AccessibilityService() {
             logFlowIncomplete("reset_before_route_labels_visible reason=$reason")
         }
         routeLabelMonitorActive = false
+        routeLabelAwaitingMapEventRescan = false
         removeDetailProfitabilityOverlay()
         if (isDebugDiagnosticsEnabled()) {
             Log.d(TAG_FLOW, "FLOW_RESET attempt=$detailFlowAttempt reason=$reason previousStage=$detailFlowStage pending=${pendingTripClick?.fingerprint ?: "none"}")
@@ -858,6 +1059,23 @@ class ScraperAccessibilityService : AccessibilityService() {
         activeFlowContext = null
         listOverlayRenderingBlocked = false
         listWithoutModalEventCount = 0
+        processMainFlow("post_detail_reset_immediate reason=$reason")
+        schedulePostDetailListRefresh(postDetailListRefreshAttempts)
+    }
+
+    private fun schedulePostDetailListRefresh(remainingAttempts: Int) {
+        if (remainingAttempts <= 0) return
+        mainHandler.postDelayed({
+            if (detailFlowStage != DetailFlowStage.IDLE || listOverlayRenderingBlocked) {
+                logOverlayTrace {
+                    "POST_DETAIL_REFRESH_SKIPPED remaining=$remainingAttempts stage=$detailFlowStage " +
+                        "blocked=$listOverlayRenderingBlocked active=${activeOverlays.size}"
+                }
+                return@postDelayed
+            }
+            processMainFlow("post_detail_refresh remaining=$remainingAttempts")
+            schedulePostDetailListRefresh(remainingAttempts - 1)
+        }, postDetailListRefreshIntervalMs)
     }
 
     private fun logFlowWaiting(reason: String, context: TripFlowContext? = activeFlowContext) {
@@ -898,6 +1116,18 @@ class ScraperAccessibilityService : AccessibilityService() {
         }
     }
 
+    private inline fun logOverlayTrace(message: () -> String) {
+        if (isDebugDiagnosticsEnabled()) {
+            Log.d(TAG_FLOW, "OVERLAY_TRACE ${message()}")
+        }
+    }
+
+    private fun compactKeys(keys: Collection<String>): String {
+        if (keys.isEmpty()) return "[]"
+        val visibleKeys = keys.take(5).joinToString(",")
+        return if (keys.size > 5) "[$visibleKeys,+${keys.size - 5}]" else "[$visibleKeys]"
+    }
+
     private fun flowContextLog(context: TripFlowContext? = activeFlowContext): String {
         return "attempt=${context?.attemptId ?: detailFlowAttempt} pending=${context?.fingerprint ?: "none"}"
     }
@@ -917,14 +1147,21 @@ class ScraperAccessibilityService : AccessibilityService() {
             "contentDesc=${event.contentDescription ?: "none"} text=$eventText"
     }
 
-    private fun processMainFlow() {
-        if (!::settingsManager.isInitialized) return
-        val rootNode = rootInActiveWindow ?: return
+    private fun processMainFlow(reason: String = "accessibility_event") {
+        if (!::settingsManager.isInitialized) {
+            logOverlayTrace { "LIST_SCAN_SKIPPED reason=$reason cause=settings_not_initialized" }
+            return
+        }
+        val rootNode = rootInActiveWindow
+        if (rootNode == null) {
+            logOverlayTrace { "LIST_SCAN_SKIPPED reason=$reason cause=root_null active=${activeOverlays.size}" }
+            return
+        }
 
         if (isTripDetailFlowActive() || listOverlayRenderingBlocked || isTripDetailModalVisible(rootNode)) {
-            clearAllOverlays()
+            clearAllOverlays("process_blocked_by_detail_or_modal")
             logFlowDebug {
-                "LIST_OVERLAY_RENDER_BLOCKED stage=$detailFlowStage blocked=$listOverlayRenderingBlocked " +
+                "LIST_OVERLAY_RENDER_BLOCKED reason=$reason stage=$detailFlowStage blocked=$listOverlayRenderingBlocked " +
                     "modalVisible=${isTripDetailModalVisible(rootNode)} activeOverlays=${activeOverlays.size}"
             }
             return
@@ -932,6 +1169,11 @@ class ScraperAccessibilityService : AccessibilityService() {
         
         val nodes = rootNode.findAccessibilityNodeInfosByViewId("sinet.startup.inDriver:id/item_order_container")
         val foundKeysInThisScan = mutableSetOf<String>()
+        val foundBoundsInThisScan = mutableMapOf<String, Rect>()
+        logOverlayTrace {
+            "LIST_SCAN_START reason=$reason nodes=${nodes.size} active=${activeOverlays.size} activeKeys=${compactKeys(activeOverlays.keys)} " +
+                "stage=$detailFlowStage blocked=$listOverlayRenderingBlocked"
+        }
 
         val maxP = settingsManager.maxPickupDistance
         val minU = settingsManager.minUsdPerKm
@@ -942,6 +1184,10 @@ class ScraperAccessibilityService : AccessibilityService() {
             val trip = extractTripData(node) ?: continue
             val tripKey = trip.fingerprint
             foundKeysInThisScan.add(tripKey)
+            overlayMissingScanCounts.remove(tripKey)
+            val currentBounds = Rect()
+            node.getBoundsInScreen(currentBounds)
+            foundBoundsInThisScan[tripKey] = Rect(currentBounds)
 
             val realSnapshot = tripEvaluationCache.findReal(trip.identity, nowMs())
             val result = realSnapshot?.let { snapshot ->
@@ -965,8 +1211,6 @@ class ScraperAccessibilityService : AccessibilityService() {
             )
 
             if (realSnapshot != null) {
-                val currentBounds = Rect()
-                node.getBoundsInScreen(currentBounds)
                 syncOverlay(tripKey, currentBounds, result)
                 logFlowDebug {
                     "LIST_REAL_OVERLAY_USED key=$tripKey status=${result.status} " +
@@ -974,16 +1218,73 @@ class ScraperAccessibilityService : AccessibilityService() {
                         "pickupKm=${realSnapshot.pickupDistanceKm} tripKm=${realSnapshot.tripDistanceKm}"
                 }
             } else if (result.status != TripStatus.RENTABLE) {
-                if (trip.pickupDistance > 0.05) executeDirectHide(node)
+                logOverlayTrace {
+                    "LIST_OVERLAY_SKIP_HIDE_PREVIEW_NON_RENTABLE key=$tripKey status=${result.status} " +
+                        "price=${trip.price} pickup=${trip.pickupDistance} foundKeys=${compactKeys(foundKeysInThisScan)}"
+                }
+                if (trip.pickupDistance > 0.05) executeDirectHide(node, "preview_not_rentable key=$tripKey")
             } else {
-                val currentBounds = Rect()
-                node.getBoundsInScreen(currentBounds)
                 syncOverlay(tripKey, currentBounds, result)
             }
         }
 
         val keysToRemove = activeOverlays.keys.filter { !foundKeysInThisScan.contains(it) }
-        keysToRemove.forEach { removeOverlay(it) }
+        logOverlayTrace {
+            "LIST_SCAN_END nodes=${nodes.size} found=${foundKeysInThisScan.size} " +
+                "foundKeys=${compactKeys(foundKeysInThisScan)} staleKeys=${compactKeys(keysToRemove)} activeBeforeRemove=${compactKeys(activeOverlays.keys)}"
+        }
+        if (foundKeysInThisScan.isEmpty() && activeOverlays.isNotEmpty()) {
+            if (isTripSearchEmptyStateVisible(rootNode)) {
+                val activeBeforeClear = activeOverlays.size
+                clearAllOverlays("trip_list_empty_search_state")
+                logOverlayTrace {
+                    "LIST_SCAN_EMPTY_CONFIRMED_SEARCH_STATE nodes=${nodes.size} activeBefore=$activeBeforeClear"
+                }
+                return
+            }
+            logOverlayTrace {
+                "LIST_SCAN_EMPTY_IGNORED_FOR_STALE nodes=${nodes.size} active=${activeOverlays.size} " +
+                    "activeKeys=${compactKeys(activeOverlays.keys)}"
+            }
+            return
+        }
+        keysToRemove.forEach { tripKey ->
+            val staleBounds = activeOverlays[tripKey]?.lastBounds
+            val overlappingBounds = staleBounds?.let { bounds ->
+                foundBoundsInThisScan.entries.firstOrNull { hasMeaningfulVerticalOverlap(bounds, it.value) }
+            }
+            if (overlappingBounds != null) {
+                removeOverlay(
+                    tripKey,
+                    "stale_bounds_overlap_live_row foundKey=${overlappingBounds.key} " +
+                        "staleBounds=$staleBounds liveBounds=${overlappingBounds.value}"
+                )
+                return@forEach
+            }
+            val missingCount = (overlayMissingScanCounts[tripKey] ?: 0) + 1
+            overlayMissingScanCounts[tripKey] = missingCount
+            if (missingCount >= staleOverlayRemovalConfirmations) {
+                removeOverlay(
+                    tripKey,
+                    "not_found_in_current_list_scan confirmed=$missingCount found=${foundKeysInThisScan.size}"
+                )
+                overlayMissingScanCounts.remove(tripKey)
+            } else {
+                logOverlayTrace {
+                    "LIST_OVERLAY_STALE_PENDING key=$tripKey missingCount=$missingCount " +
+                        "required=$staleOverlayRemovalConfirmations found=${foundKeysInThisScan.size}"
+                }
+            }
+        }
+    }
+
+    private fun hasMeaningfulVerticalOverlap(first: Rect, second: Rect): Boolean {
+        val overlap = min(first.bottom, second.bottom) - max(first.top, second.top)
+        if (overlap <= 0) return false
+
+        val minHeight = min(first.height(), second.height()).coerceAtLeast(1)
+        val requiredOverlap = max(32, (minHeight * 0.35f).toInt())
+        return overlap >= requiredOverlap
     }
 
     // SONDA AGNOSTICA: No busca valores, busca ESTRUCTURA
@@ -1025,7 +1326,12 @@ class ScraperAccessibilityService : AccessibilityService() {
     }
 
     private fun syncOverlay(tripKey: String, bounds: Rect, result: ProfitabilityResult) {
-        if (isTripDetailFlowActive() || listOverlayRenderingBlocked) return
+        if (isTripDetailFlowActive() || listOverlayRenderingBlocked) {
+            logOverlayTrace {
+                "LIST_OVERLAY_SYNC_SKIPPED key=$tripKey reason=detail_flow_active stage=$detailFlowStage blocked=$listOverlayRenderingBlocked"
+            }
+            return
+        }
 
         val overlayWidth = (bounds.width() * 0.4).toInt()
         val params = WindowManager.LayoutParams(
@@ -1051,6 +1357,13 @@ class ScraperAccessibilityService : AccessibilityService() {
                 if (record.lastBounds != bounds) {
                     record.lastBounds = Rect(bounds)
                     windowManager.updateViewLayout(record.view, params)
+                    logOverlayTrace {
+                        "LIST_OVERLAY_UPDATED_LAYOUT key=$tripKey status=${result.status} preview=${result.isPreview} bounds=$bounds"
+                    }
+                } else {
+                    logOverlayTrace {
+                        "LIST_OVERLAY_UPDATED_TEXT key=$tripKey status=${result.status} preview=${result.isPreview} bounds=$bounds"
+                    }
                 }
             } else {
                 val container = LinearLayout(this).apply {
@@ -1061,8 +1374,15 @@ class ScraperAccessibilityService : AccessibilityService() {
                 updateHUDText(container, result)
                 windowManager.addView(container, params)
                 activeOverlays[tripKey] = OverlayRecord(container, container, Rect(bounds))
+                overlayMissingScanCounts.remove(tripKey)
+                logOverlayTrace {
+                    "LIST_OVERLAY_ADDED key=$tripKey status=${result.status} preview=${result.isPreview} " +
+                        "bounds=$bounds active=${activeOverlays.size}"
+                }
             }
-        } catch (e: Exception) {}
+        } catch (e: Exception) {
+            logOverlayTrace { "LIST_OVERLAY_SYNC_FAILED key=$tripKey message=${e.message}" }
+        }
     }
 
     private fun applyListOverlayBackground(view: View, result: ProfitabilityResult) {
@@ -1095,7 +1415,7 @@ class ScraperAccessibilityService : AccessibilityService() {
             gravity = Gravity.CENTER
         })
         container.addView(TextView(this).apply {
-            text = "Gana: $" + String.format("%.2f", result.trueProfit)
+            text = formatProfitLine(result)
             setTextColor(Color.WHITE)
             textSize = 12f
             gravity = Gravity.CENTER
@@ -1131,13 +1451,14 @@ class ScraperAccessibilityService : AccessibilityService() {
 
     private fun showDetailProfitabilityOverlay(
         result: ProfitabilityResult,
-        ocrResult: RouteLabelOcr.OcrResult
+        ocrResult: RouteLabelOcr.OcrResult,
+        offerRecommendation: OfferRecommendation?
     ) {
         removeDetailProfitabilityOverlay()
 
         val displayMetrics = resources.displayMetrics
         val overlayWidth = (displayMetrics.widthPixels * 0.60).toInt()
-        val overlayHeight = (112 * displayMetrics.density).toInt()
+        val overlayHeight = ((if (offerRecommendation != null) 136 else 112) * displayMetrics.density).toInt()
         val params = WindowManager.LayoutParams(
             overlayWidth,
             overlayHeight,
@@ -1173,7 +1494,7 @@ class ScraperAccessibilityService : AccessibilityService() {
             }
         }
 
-        updateDetailProfitabilityText(container, result, ocrResult)
+        updateDetailProfitabilityText(container, result, ocrResult, offerRecommendation)
 
         try {
             windowManager.addView(container, params)
@@ -1188,7 +1509,8 @@ class ScraperAccessibilityService : AccessibilityService() {
                 if (isDebugDiagnosticsEnabled()) {
                     "DETAIL_PROFITABILITY_OVERLAY_SHOWN ${flowContextLog()} " +
                         "status=${result.status} usdKm=${result.expectedUsdPerKm} profit=${result.trueProfit} " +
-                        "pickupKm=${result.pickupDistanceKm} totalKm=${result.totalDistanceKm}"
+                        "pickupKm=${result.pickupDistanceKm} totalKm=${result.totalDistanceKm} " +
+                        "offer=${offerRecommendation?.price ?: "none"}"
                 } else {
                     "DETAIL_PROFITABILITY_OVERLAY_SHOWN attempt=$detailFlowAttempt status=${result.status} usdKm=${result.expectedUsdPerKm}"
                 }
@@ -1252,7 +1574,8 @@ class ScraperAccessibilityService : AccessibilityService() {
     private fun updateDetailProfitabilityText(
         container: LinearLayout,
         result: ProfitabilityResult,
-        ocrResult: RouteLabelOcr.OcrResult
+        ocrResult: RouteLabelOcr.OcrResult,
+        offerRecommendation: OfferRecommendation?
     ) {
         val title = when (result.status) {
             TripStatus.RENTABLE -> "RENTABLE REAL"
@@ -1267,7 +1590,7 @@ class ScraperAccessibilityService : AccessibilityService() {
             setTypeface(null, Typeface.BOLD)
         })
         container.addView(TextView(this).apply {
-            text = String.format("%.2f $/km  |  Gana: $%.2f", result.expectedUsdPerKm, result.trueProfit)
+            text = String.format("%.2f $/km  |  %s", result.expectedUsdPerKm, formatProfitLine(result))
             setTextColor(Color.WHITE)
             textSize = 13f
             gravity = Gravity.CENTER
@@ -1279,6 +1602,16 @@ class ScraperAccessibilityService : AccessibilityService() {
             textSize = 12f
             gravity = Gravity.CENTER
         })
+        if (offerRecommendation != null) {
+            container.addView(TextView(this).apply {
+                text = "Ofrecer $" + String.format("%.2f", offerRecommendation.price) +
+                    " para rentable"
+                setTextColor(Color.WHITE)
+                textSize = 12f
+                gravity = Gravity.CENTER
+                setTypeface(null, Typeface.BOLD)
+            })
+        }
     }
 
     private fun removeDetailProfitabilityOverlay() {
@@ -1288,6 +1621,11 @@ class ScraperAccessibilityService : AccessibilityService() {
             } catch (e: Exception) {}
         }
         detailProfitabilityOverlay = null
+    }
+
+    private fun formatProfitLine(result: ProfitabilityResult): String {
+        val label = if (result.trueProfit < 0.0) "Pierde" else "Gana"
+        return "$label: $" + String.format("%.2f", kotlin.math.abs(result.trueProfit))
     }
 
     private fun nowMs(): Long = SystemClock.elapsedRealtime()
@@ -1321,34 +1659,62 @@ class ScraperAccessibilityService : AccessibilityService() {
             "clickToOverlay=${deltaMs(timing.cardClickedAt, timing.overlayShownAt) ?: "na"}ms"
     }
 
-    private fun removeOverlay(tripKey: String) {
+    private fun removeOverlay(tripKey: String, reason: String) {
         activeOverlays[tripKey]?.let {
-            try { windowManager.removeView(it.view) } catch (e: Exception) {}
+            try {
+                windowManager.removeView(it.view)
+                logOverlayTrace { "LIST_OVERLAY_REMOVED key=$tripKey reason=$reason bounds=${it.lastBounds}" }
+            } catch (e: Exception) {
+                logOverlayTrace { "LIST_OVERLAY_REMOVE_FAILED key=$tripKey reason=$reason message=${e.message}" }
+            }
         }
         activeOverlays.remove(tripKey)
+        overlayMissingScanCounts.remove(tripKey)
     }
 
-    private fun clearAllOverlays() {
+    private fun clearAllOverlays(reason: String) {
+        val startedAt = nowMs()
         val removedCount = activeOverlays.size
+        val removedKeys = activeOverlays.keys.toList()
+        overlayMissingScanCounts.clear()
+        Log.d(
+            TAG_CLEANUP_TRACE,
+            "TEMP_CLEAR_START reason=$reason active=$removedCount generation=$overlayClearGeneration " +
+                "stage=$detailFlowStage blocked=$listOverlayRenderingBlocked " +
+                "sinceCardClickMs=${deltaMs(lastCardClickForCleanupAt, startedAt) ?: "na"}"
+        )
         val iterator = activeOverlays.entries.iterator()
         while (iterator.hasNext()) {
             val entry = iterator.next()
             try {
                 windowManager.removeView(entry.value.view)
-            } catch (e: Exception) {}
+                logOverlayTrace { "LIST_OVERLAY_CLEAR_ITEM key=${entry.key} reason=$reason bounds=${entry.value.lastBounds}" }
+            } catch (e: Exception) {
+                logOverlayTrace { "LIST_OVERLAY_CLEAR_ITEM_FAILED key=${entry.key} reason=$reason message=${e.message}" }
+            }
             iterator.remove()
         }
         if (removedCount > 0) {
             overlayClearGeneration += 1
-            logFlowDebug { "OVERLAYS_CLEARED attempt=$detailFlowAttempt removed=$removedCount generation=$overlayClearGeneration" }
+            logFlowDebug {
+                "OVERLAYS_CLEARED attempt=$detailFlowAttempt reason=$reason removed=$removedCount " +
+                    "generation=$overlayClearGeneration keys=${compactKeys(removedKeys)}"
+            }
         }
+        Log.d(
+            TAG_CLEANUP_TRACE,
+            "TEMP_CLEAR_END reason=$reason removed=$removedCount activeAfter=${activeOverlays.size} " +
+                "durationMs=${nowMs() - startedAt} generation=$overlayClearGeneration"
+        )
     }
 
-    private fun executeDirectHide(node: AccessibilityNodeInfo) {
+    private fun executeDirectHide(node: AccessibilityNodeInfo, reason: String) {
         val hideBtn = node.findAccessibilityNodeInfosByViewId("sinet.startup.inDriver:id/item_order_options_container_hide").firstOrNull()
         if (hideBtn != null) {
+            logOverlayTrace { "LIST_TRIP_HIDE_DIRECT reason=$reason action=hide_button" }
             hideBtn.performAction(AccessibilityNodeInfo.ACTION_CLICK)
         } else {
+            logOverlayTrace { "LIST_TRIP_HIDE_DIRECT reason=$reason action=dots_menu" }
             node.findAccessibilityNodeInfosByViewId("sinet.startup.inDriver:id/item_order_imageview_dots")
                 .firstOrNull()?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
         }
@@ -1389,7 +1755,7 @@ class ScraperAccessibilityService : AccessibilityService() {
     }
 
     override fun onDestroy() {
-        clearAllOverlays()
+        clearAllOverlays("service_destroy")
         screenshotExecutor.shutdownNow()
         super.onDestroy()
     }

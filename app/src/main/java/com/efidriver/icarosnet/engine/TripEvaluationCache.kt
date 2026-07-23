@@ -44,6 +44,7 @@ class TripEvaluationCache(
         prune(nowMs)
         identity.strongKey?.let { strongKey ->
             realByStrongKey[strongKey]?.let { return it }
+            return null
         }
         return realByWeakKey[identity.weakKey]
     }
