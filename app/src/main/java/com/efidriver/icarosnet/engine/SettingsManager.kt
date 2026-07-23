@@ -27,7 +27,4 @@ class SettingsManager(context: Context) {
         get() = roundToTwo(prefs.getFloat("commission", 15.0f))
         set(value) = prefs.edit().putFloat("commission", value.toFloat()).apply()
 
-    var structuralProbeDebugEnabled: Boolean
-        get() = prefs.getBoolean("structural_probe_debug_enabled", false)
-        set(value) = prefs.edit().putBoolean("structural_probe_debug_enabled", value).apply()
 }
