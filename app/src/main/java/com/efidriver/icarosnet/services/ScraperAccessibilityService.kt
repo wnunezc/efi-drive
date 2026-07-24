@@ -39,6 +39,7 @@ import com.efidriver.icarosnet.services.scraping.TripActionExecutor
 import com.efidriver.icarosnet.services.scraping.TripDetailParser
 import com.efidriver.icarosnet.services.scraping.TripListScanner
 import com.efidriver.icarosnet.services.scraping.TripListOverlayCoordinator
+import kotlinx.coroutines.*
 import java.util.concurrent.Executors
 import kotlin.math.max
 import kotlin.math.min
@@ -54,6 +55,7 @@ class ScraperAccessibilityService : AccessibilityService() {
     private val TAG_RUNTIME_TRACE = "EfiRuntimeTrace"
     private val screenshotExecutor = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     
     private val runtimeTracer = RuntimeFlowTracer()
     private val detailFlowTimingTracker = DetailFlowTimingTracker()
@@ -104,12 +106,18 @@ class ScraperAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         settingsManager = SettingsManager(this)
         licenseManager = AppLicenseManager(this)
-        windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         listOverlayManager = ListOverlayManager(
             context = this,
             windowManager = windowManager,
             lifecycleMonitor = tripLifecycleMonitor,
-            isRenderingBlocked = { isTripDetailFlowActive() || listOverlayRenderingBlocked },
+            isRenderingBlocked = { 
+                val root = rootInActiveWindow
+                isTripDetailFlowActive() || 
+                    listOverlayRenderingBlocked || 
+                    (root?.packageName != "sinet.startup.inDriver") ||
+                    detailDetector.isTripDetailModalVisible(root)
+            },
             isVerbose = { isRuntimeVerboseEnabled() },
             trace = { message -> logOverlayTrace { message } }
         )
@@ -125,6 +133,7 @@ class ScraperAccessibilityService : AccessibilityService() {
             nowMs = { nowMs() }
         )
         tripListOverlayCoordinator = TripListOverlayCoordinator(
+            scope = serviceScope,
             settingsManager = settingsManager,
             tripListScanner = tripListScanner,
             tripActionExecutor = tripActionExecutor,
@@ -134,7 +143,6 @@ class ScraperAccessibilityService : AccessibilityService() {
             isListRenderingBlocked = { rootNode ->
                 isTripDetailFlowActive() || listOverlayRenderingBlocked || detailDetector.isTripDetailModalVisible(rootNode)
             },
-            isVerbose = { isRuntimeVerboseEnabled() },
             clearAllOverlays = { request -> clearAllOverlays(request) },
             logOverlayRemoval = { request, result, activeBefore, trackedBefore, keysBefore ->
                 logOverlayRemovalEvidence(request, result, activeBefore, trackedBefore, keysBefore)
@@ -157,9 +165,20 @@ class ScraperAccessibilityService : AccessibilityService() {
         currentEventSnapshot = AccessibilityEventSnapshot.from(event)
         
         if (packageName == "sinet.startup.inDriver") {
+            runtimeTracer.recordEvent()
             if (!isLicenseAllowedForService()) {
                 return
             }
+
+            // INVENTARIO DE EVENTOS: Reaccionamos a cambios estructurales o de ventana.
+            // Eliminamos el filtro estricto de SUBTREE para no quedar ciegos ante actualizaciones rápidas.
+            val isRelevantEvent = event?.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
+                event?.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+            
+            if (!isRelevantEvent) {
+                return
+            }
+
             if (detailCardFlowEnabled) {
                 observeTripDetailFlow(event)
             }
@@ -211,6 +230,11 @@ class ScraperAccessibilityService : AccessibilityService() {
                 }
             }
         }
+    }
+
+    override fun onUnbind(intent: android.content.Intent?): Boolean {
+        serviceScope.cancel()
+        return super.onUnbind(intent)
     }
 
     private fun isLicenseAllowedForService(): Boolean {
@@ -1193,6 +1217,9 @@ class ScraperAccessibilityService : AccessibilityService() {
     }
 
     private fun clearAllOverlays(request: OverlayRemovalRequest) {
+        if (::tripListOverlayCoordinator.isInitialized) {
+            tripListOverlayCoordinator.cancelAllActiveJobs()
+        }
         val activeBefore = listOverlayManager.activeCount
         val trackedBefore = listOverlayManager.trackedViewCount
         val keysBefore = listOverlayManager.keys.toList()
@@ -1203,9 +1230,6 @@ class ScraperAccessibilityService : AccessibilityService() {
             blocked = listOverlayRenderingBlocked,
             sinceCardClickMs = deltaMs(lastCardClickForCleanupAt, nowMs())
         )
-        if (::tripListOverlayCoordinator.isInitialized) {
-            tripListOverlayCoordinator.clearMissingState()
-        }
         logOverlayRemovalEvidence(
             request = request,
             removedKeys = result.removedKeys,
@@ -1334,6 +1358,7 @@ class ScraperAccessibilityService : AccessibilityService() {
     }
 
     override fun onDestroy() {
+        serviceScope.cancel()
         clearAllOverlays(
             OverlayRemovalRequest(
                 type = OverlayRemovalType.GROUP,

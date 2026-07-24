@@ -8,7 +8,22 @@ class RuntimeFlowTracer(
     private val isEnabled: () -> Boolean = { Log.isLoggable(TAG_RUNTIME_TRACE, Log.VERBOSE) },
     private val nowMs: () -> Long = { SystemClock.elapsedRealtime() }
 ) {
+    private var eventCount = 0
+    private var lastEventWindowMs = 0L
+
     fun now(): Long = nowMs()
+
+    fun recordEvent() {
+        val now = nowMs()
+        if (now - lastEventWindowMs > 1000) {
+            if (eventCount > 0) {
+                mark("DIAG_EVENT_DENSITY", "eventsPerSec=$eventCount")
+            }
+            eventCount = 0
+            lastEventWindowMs = now
+        }
+        eventCount++
+    }
 
     fun mark(event: String, details: String = "") {
         if (!isEnabled()) return

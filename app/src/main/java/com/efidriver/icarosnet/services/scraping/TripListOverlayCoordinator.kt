@@ -1,7 +1,5 @@
 package com.efidriver.icarosnet.services.scraping
 
-import android.graphics.Rect
-import android.util.Log
 import android.view.accessibility.AccessibilityNodeInfo
 import com.efidriver.icarosnet.engine.ProfitabilityEngine
 import com.efidriver.icarosnet.engine.SettingsManager
@@ -12,10 +10,11 @@ import com.efidriver.icarosnet.services.monitoring.OverlayRemovalType
 import com.efidriver.icarosnet.services.monitoring.RuntimeFlowTracer
 import com.efidriver.icarosnet.services.monitoring.TripLifecycleMonitor
 import com.efidriver.icarosnet.services.overlay.ListOverlayManager
-import kotlin.math.max
-import kotlin.math.min
+import kotlinx.coroutines.*
+import java.util.concurrent.ConcurrentHashMap
 
 class TripListOverlayCoordinator(
+    private val scope: CoroutineScope,
     private val settingsManager: SettingsManager,
     private val tripListScanner: TripListScanner,
     private val tripActionExecutor: TripActionExecutor,
@@ -23,7 +22,6 @@ class TripListOverlayCoordinator(
     private val listOverlayManager: ListOverlayManager,
     private val tripEvaluationCache: TripEvaluationCache,
     private val isListRenderingBlocked: (AccessibilityNodeInfo) -> Boolean,
-    private val isVerbose: () -> Boolean,
     private val clearAllOverlays: (OverlayRemovalRequest) -> Unit,
     private val logOverlayRemoval: (OverlayRemovalRequest, ListOverlayManager.RemovalResult, Int, Int, List<String>) -> Unit,
     private val logOverlayRemovalTrigger: (OverlayRemovalRequest, Int, Int, List<String>) -> Unit,
@@ -46,220 +44,144 @@ class TripListOverlayCoordinator(
         val commissionPercent: Double
     )
 
-    private val overlayMissingScanCounts = mutableMapOf<String, Int>()
+    private val activeTripJobs = ConcurrentHashMap<String, Job>()
+    private var lastScanFinishedAt = 0L
+    private val minScanIntervalMs = 60L
+    private var lastScanSignature = ""
 
     fun process(rootNode: AccessibilityNodeInfo?, reason: String): ProcessResult {
-        if (rootNode == null) {
-            traceOverlay("LIST_SCAN_SKIPPED reason=$reason cause=root_null active=${listOverlayManager.activeCount}")
+        val now = nowMs()
+        if (rootNode == null || now - lastScanFinishedAt < minScanIntervalMs) {
             return ProcessResult(scanned = false, rowCount = 0, foundCount = 0, activeOverlayCount = listOverlayManager.activeCount)
         }
 
         if (isListRenderingBlocked(rootNode)) {
+            cancelAllActiveJobs()
+            lastScanSignature = "" // Resetear firma al bloquearse
             clearAllOverlays(
                 OverlayRemovalRequest(
                     type = OverlayRemovalType.GROUP,
                     reason = "process_blocked_by_detail_or_modal",
-                    trigger = "list_scan_blocked",
-                    fallback = "none"
+                    trigger = "list_scan_blocked"
                 )
             )
-            traceFlow("LIST_OVERLAY_RENDER_BLOCKED reason=$reason activeOverlays=${listOverlayManager.activeCount}")
             return ProcessResult(scanned = false, rowCount = 0, foundCount = 0, activeOverlayCount = listOverlayManager.activeCount)
         }
 
-        val processStartedAt = nowMs()
         val scanId = tripLifecycleMonitor.nextScanId()
-        val scannerStartedAt = nowMs()
         val rows = tripListScanner.scan(rootNode)
-        val scannerDurationMs = nowMs() - scannerStartedAt
+        
+        // FIRMA ESTRUCTURAL: Comparamos si los viajes y sus posiciones son idénticos al escaneo anterior.
+        // Formato: "id1:top1;id2:top2;..."
+        val currentSignature = rows.joinToString(";") { "${it.trip.fingerprint}:${it.bounds.top}" }
+        if (currentSignature == lastScanSignature && rows.isNotEmpty()) {
+            // Si nada ha cambiado, no actualizamos nada para ahorrar CPU y evitar lag del WindowManager.
+            lastScanFinishedAt = now
+            return ProcessResult(scanned = true, rowCount = rows.size, foundCount = 0, activeOverlayCount = listOverlayManager.activeCount)
+        }
+        lastScanSignature = currentSignature
+
+        val foundKeysInThisScan = rows.map { it.trip.fingerprint }.toSet()
+        val activeKeysBefore = listOverlayManager.keys
+        
         val settings = SettingsSnapshot(
             maxPickupDistanceKm = settingsManager.maxPickupDistance,
             minUsdPerKm = settingsManager.minUsdPerKm,
             previewTripDistanceKm = settingsManager.previewTripDistanceKm,
             commissionPercent = settingsManager.commissionPercent
         )
-        val foundKeysInThisScan = mutableSetOf<String>()
-        val foundBoundsInThisScan = mutableMapOf<String, Rect>()
-        runtimeTracer.mark(
-            "LIST_SCAN_STARTED",
-            "scan=$scanId reason=$reason active=${listOverlayManager.activeCount}"
-        )
-        traceOverlay(
-            "LIST_SCAN_START reason=$reason nodes=${rows.size} active=${listOverlayManager.activeCount} " +
-                "activeKeys=${compactKeys(listOverlayManager.keys)}"
-        )
 
-        for (row in rows) {
-            val rowStartedAt = nowMs()
-            val trip = row.trip
-            val tripKey = trip.fingerprint
-            foundKeysInThisScan.add(tripKey)
-            overlayMissingScanCounts.remove(tripKey)
-            val currentBounds = row.bounds
-            foundBoundsInThisScan[tripKey] = Rect(currentBounds)
-            tripLifecycleMonitor.markTripSeen(
-                tripKey,
-                scanId,
-                currentBounds,
-                trip.price,
-                trip.pickupDistance,
-                listOverlayManager.activeCount
+        runtimeTracer.mark("LIST_SCAN_STARTED", "scan=$scanId reason=$reason rows=${rows.size}")
+
+        // 1. REMOCIÓN ATÓMICA O INDIVIDUAL
+        if (rows.isEmpty() && activeKeysBefore.isNotEmpty()) {
+            // OPTIMIZACIÓN: Si la lista desapareció por completo (ej. abriste tarjeta), 
+            // limpiamos todo de un solo golpe atómico para evitar el lag de 500ms.
+            cancelAllActiveJobs()
+            clearAllOverlays(
+                OverlayRemovalRequest(
+                    type = OverlayRemovalType.GROUP,
+                    reason = "instant_removal_list_disappeared",
+                    trigger = "list_scan_empty"
+                )
             )
-
-            val calcStartedAt = nowMs()
-            val realSnapshot = tripEvaluationCache.findReal(trip.identity, nowMs())
-            val result = realSnapshot?.let { snapshot ->
-                ProfitabilityEngine.calculate(
-                    tripPrice = trip.price,
-                    pickupDistanceKm = snapshot.pickupDistanceKm,
-                    tripDistanceKm = snapshot.tripDistanceKm,
-                    maxPickupDistanceKm = settings.maxPickupDistanceKm,
-                    minUsdPerKm = settings.minUsdPerKm,
-                    commissionPercent = settings.commissionPercent,
-                    isPreview = false
-                )
-            } ?: ProfitabilityEngine.calculate(
-                tripPrice = trip.price,
-                pickupDistanceKm = trip.pickupDistance,
-                tripDistanceKm = settings.previewTripDistanceKm,
-                maxPickupDistanceKm = settings.maxPickupDistanceKm,
-                minUsdPerKm = settings.minUsdPerKm,
-                commissionPercent = settings.commissionPercent,
-                isPreview = true
-            )
-            val calcDurationMs = nowMs() - calcStartedAt
-
-            if (realSnapshot != null) {
-                val syncStartedAt = nowMs()
-                val synced = listOverlayManager.sync(tripKey, currentBounds, result)
-                val syncDurationMs = nowMs() - syncStartedAt
-                traceFlow(
-                    "LIST_REAL_OVERLAY_USED key=$tripKey status=${result.status} " +
-                        "storedPrice=${realSnapshot.price} currentPrice=${trip.price} " +
-                        "pickupKm=${realSnapshot.pickupDistanceKm} tripKm=${realSnapshot.tripDistanceKm}"
-                )
-                runtimeTracer.mark(
-                    "LIST_ROW_PROCESSED",
-                    "scan=$scanId key=$tripKey mode=real status=${result.status} synced=$synced " +
-                        "calcMs=$calcDurationMs syncMs=$syncDurationMs totalRowMs=${nowMs() - rowStartedAt}"
-                )
-            } else if (result.status != TripStatus.RENTABLE) {
-                traceOverlay(
-                    "LIST_OVERLAY_SKIP_HIDE_PREVIEW_NON_RENTABLE key=$tripKey status=${result.status} " +
-                        "price=${trip.price} pickup=${trip.pickupDistance} foundKeys=${compactKeys(foundKeysInThisScan)}"
-                )
-                if (trip.pickupDistance > 0.05) {
-                    val hideStartedAt = nowMs()
-                    Log.d(
-                        TAG_RUNTIME_TRACE,
-                        "PREVIEW_HIDE_REQUEST key=$tripKey scan=$scanId seenToHide=${tripLifecycleMonitor.ageMs(tripKey)}ms " +
-                            "price=${trip.price} pickup=${trip.pickupDistance} status=${result.status}"
+        } else {
+            // Remoción individual para cambios normales en la lista
+            activeKeysBefore.filter { it !in foundKeysInThisScan }.forEach { staleKey ->
+                activeTripJobs[staleKey]?.cancel()
+                activeTripJobs.remove(staleKey)
+                removeOverlay(
+                    staleKey,
+                    OverlayRemovalRequest(
+                        type = OverlayRemovalType.INDIVIDUAL,
+                        reason = "instant_removal_not_in_xml",
+                        trigger = "list_scan_diff",
+                        targetKey = staleKey
                     )
-                    tripActionExecutor.hideTrip(row.node, "preview_not_rentable key=$tripKey")
-                    runtimeTracer.end(
-                        "LIST_ROW_HIDE_COMPLETED",
-                        hideStartedAt,
-                        "scan=$scanId key=$tripKey status=${result.status} calcMs=$calcDurationMs totalRowMs=${nowMs() - rowStartedAt}"
-                    )
-                }
-            } else {
-                val syncStartedAt = nowMs()
-                val synced = listOverlayManager.sync(tripKey, currentBounds, result)
-                val syncDurationMs = nowMs() - syncStartedAt
-                runtimeTracer.mark(
-                    "LIST_ROW_PROCESSED",
-                    "scan=$scanId key=$tripKey mode=preview status=${result.status} synced=$synced " +
-                        "calcMs=$calcDurationMs syncMs=$syncDurationMs totalRowMs=${nowMs() - rowStartedAt}"
                 )
             }
         }
 
-        val keysToRemove = listOverlayManager.keys.filter { !foundKeysInThisScan.contains(it) }
-        traceOverlay(
-            "LIST_SCAN_END nodes=${rows.size} found=${foundKeysInThisScan.size} " +
-                "foundKeys=${compactKeys(foundKeysInThisScan)} staleKeys=${compactKeys(keysToRemove)} " +
-                "activeBeforeRemove=${compactKeys(listOverlayManager.keys)}"
-        )
-        if (isVerbose()) {
-            tripLifecycleMonitor.logScanEnd(scanId, rows.size, foundKeysInThisScan.size, listOverlayManager.activeCount, nowMs() - processStartedAt)
+        // 2. PROCESAMIENTO PARALELO ATÓMICO POR VIAJE
+        rows.forEach { row ->
+            val tripKey = row.trip.fingerprint
+            activeTripJobs[tripKey]?.cancel() // Solo cancelamos el job anterior de ESTE viaje
+            
+            activeTripJobs[tripKey] = scope.launch(Dispatchers.Main) {
+                val rowStartedAt = nowMs()
+                val trip = row.trip
+                val currentBounds = row.bounds
+
+                tripLifecycleMonitor.markTripSeen(tripKey, scanId, currentBounds, trip.price, trip.pickupDistance, listOverlayManager.activeCount)
+
+                val result = withContext(Dispatchers.Default) {
+                    val realSnapshot = tripEvaluationCache.findReal(trip.identity, nowMs())
+                    realSnapshot?.let { snapshot ->
+                        ProfitabilityEngine.calculate(
+                            tripPrice = trip.price,
+                            pickupDistanceKm = snapshot.pickupDistanceKm,
+                            tripDistanceKm = snapshot.tripDistanceKm,
+                            maxPickupDistanceKm = settings.maxPickupDistanceKm,
+                            minUsdPerKm = settings.minUsdPerKm,
+                            commissionPercent = settings.commissionPercent,
+                            isPreview = false
+                        )
+                    } ?: ProfitabilityEngine.calculate(
+                        tripPrice = trip.price,
+                        pickupDistanceKm = trip.pickupDistance,
+                        tripDistanceKm = settings.previewTripDistanceKm,
+                        maxPickupDistanceKm = settings.maxPickupDistanceKm,
+                        minUsdPerKm = settings.minUsdPerKm,
+                        commissionPercent = settings.commissionPercent,
+                        isPreview = true
+                    )
+                }
+
+                if (result.status == TripStatus.RENTABLE) {
+                    listOverlayManager.sync(tripKey, currentBounds, result)
+                } else if (trip.pickupDistance > 0.05) {
+                    tripActionExecutor.hideTrip(row.node, "parallel_not_rentable key=$tripKey")
+                }
+                
+                activeTripJobs.remove(tripKey)
+            }
         }
-        runtimeTracer.end(
-            "LIST_SCAN_COMPLETED",
-            processStartedAt,
-            "scan=$scanId reason=$reason rows=${rows.size} found=${foundKeysInThisScan.size} " +
-                "scannerMs=$scannerDurationMs active=${listOverlayManager.activeCount} stale=${keysToRemove.size}"
-        )
+
+        // 3. LIMPIEZA POR ESTADO VACÍO
         if (foundKeysInThisScan.isEmpty() && listOverlayManager.activeCount > 0) {
             if (tripListScanner.isTripSearchEmptyStateVisible(rootNode)) {
-                val activeBeforeClear = listOverlayManager.activeCount
                 clearAllOverlays(
                     OverlayRemovalRequest(
                         type = OverlayRemovalType.GROUP,
                         reason = "trip_list_empty_search_state",
-                        trigger = "list_scan_empty_confirmed",
-                        fallback = "empty_scan_ignored_unless_search_state_visible",
-                        rowsFound = rows.size,
-                        keysFound = foundKeysInThisScan.toList()
+                        trigger = "list_scan_empty_confirmed"
                     )
-                )
-                traceOverlay("LIST_SCAN_EMPTY_CONFIRMED_SEARCH_STATE nodes=${rows.size} activeBefore=$activeBeforeClear")
-                return ProcessResult(scanned = true, rowCount = rows.size, foundCount = foundKeysInThisScan.size, activeOverlayCount = listOverlayManager.activeCount)
-            }
-            traceOverlay(
-                "LIST_SCAN_EMPTY_IGNORED_FOR_STALE nodes=${rows.size} active=${listOverlayManager.activeCount} " +
-                    "activeKeys=${compactKeys(listOverlayManager.keys)}"
-            )
-            return ProcessResult(scanned = true, rowCount = rows.size, foundCount = foundKeysInThisScan.size, activeOverlayCount = listOverlayManager.activeCount)
-        }
-        keysToRemove.forEach { tripKey ->
-            val staleBounds = listOverlayManager.lastBounds(tripKey)
-            val overlappingBounds = staleBounds?.let { bounds ->
-                foundBoundsInThisScan.entries.firstOrNull { hasMeaningfulVerticalOverlap(bounds, it.value) }
-            }
-            if (overlappingBounds != null) {
-                removeOverlay(
-                    tripKey,
-                    OverlayRemovalRequest(
-                        type = OverlayRemovalType.INDIVIDUAL,
-                        reason = "stale_bounds_overlap_live_row foundKey=${overlappingBounds.key} " +
-                            "staleBounds=$staleBounds liveBounds=${overlappingBounds.value}",
-                        trigger = "list_scan_stale_overlap",
-                        fallback = "bypass_three_scan_confirmation_to_prevent_overlap",
-                        rowsFound = rows.size,
-                        keysFound = foundKeysInThisScan.toList(),
-                        targetKey = tripKey
-                    )
-                )
-                return@forEach
-            }
-            val missingCount = (overlayMissingScanCounts[tripKey] ?: 0) + 1
-            overlayMissingScanCounts[tripKey] = missingCount
-            if (missingCount >= STALE_OVERLAY_REMOVAL_CONFIRMATIONS) {
-                removeOverlay(
-                    tripKey,
-                    OverlayRemovalRequest(
-                        type = OverlayRemovalType.INDIVIDUAL,
-                        reason = "not_found_in_current_list_scan confirmed=$missingCount found=${foundKeysInThisScan.size}",
-                        trigger = "list_scan_stale_confirmed",
-                        fallback = "required_absent_scans=$STALE_OVERLAY_REMOVAL_CONFIRMATIONS",
-                        rowsFound = rows.size,
-                        keysFound = foundKeysInThisScan.toList(),
-                        targetKey = tripKey
-                    )
-                )
-                overlayMissingScanCounts.remove(tripKey)
-            } else {
-                traceOverlay(
-                    "LIST_OVERLAY_STALE_PENDING key=$tripKey missingCount=$missingCount " +
-                        "required=$STALE_OVERLAY_REMOVAL_CONFIRMATIONS found=${foundKeysInThisScan.size}"
                 )
             }
         }
-        return ProcessResult(scanned = true, rowCount = rows.size, foundCount = foundKeysInThisScan.size, activeOverlayCount = listOverlayManager.activeCount)
-    }
 
-    fun clearMissingState() {
-        overlayMissingScanCounts.clear()
+        lastScanFinishedAt = nowMs()
+        return ProcessResult(scanned = true, rowCount = rows.size, foundCount = foundKeysInThisScan.size, activeOverlayCount = listOverlayManager.activeCount)
     }
 
     private fun removeOverlay(tripKey: String, request: OverlayRemovalRequest) {
@@ -269,26 +191,13 @@ class TripListOverlayCoordinator(
         logOverlayRemovalTrigger(request, activeBefore, trackedBefore, keysBefore)
         val result = listOverlayManager.remove(tripKey, request.reason)
         logOverlayRemoval(request, result, activeBefore, trackedBefore, keysBefore)
-        overlayMissingScanCounts.remove(tripKey)
     }
 
-    private fun hasMeaningfulVerticalOverlap(first: Rect, second: Rect): Boolean {
-        val overlap = min(first.bottom, second.bottom) - max(first.top, second.top)
-        if (overlap <= 0) return false
-
-        val minHeight = min(first.height(), second.height()).coerceAtLeast(1)
-        val requiredOverlap = max(32, (minHeight * 0.35f).toInt())
-        return overlap >= requiredOverlap
-    }
-
-    private fun compactKeys(keys: Collection<String>): String {
-        if (keys.isEmpty()) return "[]"
-        val visibleKeys = keys.take(5).joinToString(",")
-        return if (keys.size > 5) "[$visibleKeys,+${keys.size - 5}]" else "[$visibleKeys]"
-    }
-
-    private companion object {
-        private const val TAG_RUNTIME_TRACE = "EfiRuntimeTrace"
-        private const val STALE_OVERLAY_REMOVAL_CONFIRMATIONS = 3
+    fun cancelAllActiveJobs() {
+        if (activeTripJobs.isNotEmpty()) {
+            runtimeTracer.mark("DIAG_COORD_KILL_ALL", "count=${activeTripJobs.size}")
+            activeTripJobs.values.forEach { it.cancel() }
+            activeTripJobs.clear()
+        }
     }
 }

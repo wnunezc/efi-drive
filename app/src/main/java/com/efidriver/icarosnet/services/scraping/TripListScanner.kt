@@ -12,13 +12,19 @@ class TripListScanner {
     )
 
     fun scan(rootNode: AccessibilityNodeInfo): List<TripRow> {
-        return rootNode.findAccessibilityNodeInfosByViewId(ID_ITEM_ORDER_CONTAINER)
-            .mapNotNull { node ->
-                val trip = extractTripData(node) ?: return@mapNotNull null
-                val bounds = Rect()
-                node.getBoundsInScreen(bounds)
-                TripRow(node, trip, bounds)
-            }
+        // Fase 1: Búsqueda robusta por ID en todo el árbol (vuelve a ser estable)
+        val rowNodes = rootNode.findAccessibilityNodeInfosByViewId(ID_ITEM_ORDER_CONTAINER)
+        if (rowNodes.isEmpty()) return emptyList()
+
+        return rowNodes.mapNotNull { node ->
+            // Filtro de coordenadas básico: solo procesar si el nodo tiene dimensiones válidas
+            val bounds = Rect()
+            node.getBoundsInScreen(bounds)
+            if (bounds.isEmpty) return@mapNotNull null
+
+            val trip = extractTripDataRobust(node) ?: return@mapNotNull null
+            TripRow(node, trip, bounds)
+        }
     }
 
     fun isTripListVisible(rootNode: AccessibilityNodeInfo): Boolean {
@@ -26,53 +32,65 @@ class TripListScanner {
     }
 
     fun isTripSearchEmptyStateVisible(rootNode: AccessibilityNodeInfo): Boolean {
-        return hasNodeByText(rootNode, "Buscando en un área más amplia") ||
-            hasNodeByText(rootNode, "Buscando en un area mas amplia") ||
-            collectNodeTexts(rootNode).any { text ->
-                text.contains("Buscando en un", ignoreCase = true) &&
-                    (
-                        text.contains("área", ignoreCase = true) ||
-                            text.contains("area", ignoreCase = true)
-                    )
+        return rootNode.findAccessibilityNodeInfosByText("Buscando en un").any { 
+            val txt = it.text?.toString() ?: ""
+            txt.contains("área", ignoreCase = true) || txt.contains("area", ignoreCase = true)
+        }
+    }
+
+    /**
+     * Extracción robusta de datos: combina búsqueda directa para el nombre (ancla) 
+     * con un recorrido ligero para el resto de datos.
+     */
+    private fun extractTripDataRobust(rowNode: AccessibilityNodeInfo): Trip? {
+        // Primero intentamos por ID exacto, si no, buscamos el primer texto disponible (Fallback)
+        val nameNode = rowNode.findAccessibilityNodeInfosByViewId(ID_NAME).firstOrNull()
+        val name = nameNode?.text?.toString() ?: findFirstText(rowNode) ?: return null
+
+        var priceText: String? = null
+        var distanceText: String? = null
+        var from: String? = null
+        var to: String? = null
+
+        fun findRemaining(node: AccessibilityNodeInfo) {
+            val viewId = node.viewIdResourceName ?: ""
+            val txt = node.text?.toString() ?: ""
+            
+            when {
+                viewId.endsWith("info_textview_stage_price_view") || txt.contains("$") -> {
+                    if (priceText == null) priceText = txt
+                }
+                viewId.endsWith("order_info_stage_textview_distance") || txt.contains("km") || txt.contains("metro") -> {
+                    if (distanceText == null) distanceText = txt
+                }
+                viewId.endsWith("order_info_textview_from_address") -> from = txt
+                viewId.contains("to_address") || viewId.contains("destination_address") -> to = txt
             }
-    }
-
-    private fun extractTripData(node: AccessibilityNodeInfo): Trip? {
-        return try {
-            val name = node.findAccessibilityNodeInfosByViewId(ID_NAME).firstOrNull()?.text?.toString() ?: return null
-            val priceText = node.findAccessibilityNodeInfosByViewId(ID_PRICE).firstOrNull()?.text?.toString() ?: ""
-            val distanceText = node.findAccessibilityNodeInfosByViewId(ID_DISTANCE).firstOrNull()?.text?.toString() ?: ""
-            val from = node.findAccessibilityNodeInfosByViewId(ID_FROM).firstOrNull()?.text?.toString() ?: ""
-            val to = findFirstTextByIds(node, ID_TO, ID_DESTINATION, ID_STAGE_TO) ?: ""
-            Trip(name.trim(), parseDoubleSafe(priceText), parseDoubleSafe(distanceText), from.trim(), to.trim())
-        } catch (e: Exception) {
-            null
+            
+            if (priceText != null && distanceText != null && from != null && to != null) return
+            for (i in 0 until node.childCount) {
+                node.getChild(i)?.let { findRemaining(it) }
+            }
         }
+
+        findRemaining(rowNode)
+
+        return Trip(
+            passengerName = name.trim(),
+            price = parseDoubleSafe(priceText ?: ""),
+            pickupDistance = parseDoubleSafe(distanceText ?: ""),
+            fromAddress = from?.trim() ?: "",
+            toAddress = to?.trim() ?: ""
+        )
     }
 
-    private fun findFirstTextByIds(node: AccessibilityNodeInfo, vararg viewIds: String): String? {
-        return viewIds.firstNotNullOfOrNull { viewId ->
-            node.findAccessibilityNodeInfosByViewId(viewId)
-                .firstOrNull()
-                ?.text
-                ?.toString()
-                ?.trim()
-                ?.takeIf { it.isNotEmpty() }
+    private fun findFirstText(node: AccessibilityNodeInfo): String? {
+        if (!node.text.isNullOrBlank()) return node.text.toString()
+        for (i in 0 until node.childCount) {
+            val found = node.getChild(i)?.let { findFirstText(it) }
+            if (found != null) return found
         }
-    }
-
-    private fun collectNodeTexts(node: AccessibilityNodeInfo?): List<String> {
-        if (node == null) return emptyList()
-        val texts = mutableListOf<String>()
-        node.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let(texts::add)
-        for (index in 0 until node.childCount) {
-            texts.addAll(collectNodeTexts(node.getChild(index)))
-        }
-        return texts
-    }
-
-    private fun hasNodeByText(rootNode: AccessibilityNodeInfo, text: String): Boolean {
-        return rootNode.findAccessibilityNodeInfosByText(text).isNotEmpty()
+        return null
     }
 
     private fun parseDoubleSafe(text: String): Double {
@@ -85,11 +103,5 @@ class TripListScanner {
     private companion object {
         private const val ID_ITEM_ORDER_CONTAINER = "sinet.startup.inDriver:id/item_order_container"
         private const val ID_NAME = "sinet.startup.inDriver:id/driver_common_textview_name"
-        private const val ID_PRICE = "sinet.startup.inDriver:id/info_textview_stage_price_view"
-        private const val ID_DISTANCE = "sinet.startup.inDriver:id/order_info_stage_textview_distance"
-        private const val ID_FROM = "sinet.startup.inDriver:id/order_info_textview_from_address"
-        private const val ID_TO = "sinet.startup.inDriver:id/order_info_textview_to_address"
-        private const val ID_DESTINATION = "sinet.startup.inDriver:id/order_info_textview_destination_address"
-        private const val ID_STAGE_TO = "sinet.startup.inDriver:id/order_info_stage_textview_to_address"
     }
 }

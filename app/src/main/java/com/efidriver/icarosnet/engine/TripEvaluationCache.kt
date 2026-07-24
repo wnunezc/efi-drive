@@ -2,6 +2,7 @@ package com.efidriver.icarosnet.engine
 
 import com.efidriver.icarosnet.models.ProfitabilityResult
 import com.efidriver.icarosnet.models.TripIdentity
+import java.util.concurrent.ConcurrentHashMap
 
 enum class TripEvaluationKind {
     PREVIEW,
@@ -23,9 +24,9 @@ data class TripEvaluationSnapshot(
 class TripEvaluationCache(
     private val ttlMs: Long = 5 * 60 * 1000L
 ) {
-    private val realByStrongKey = linkedMapOf<String, TripEvaluationSnapshot>()
-    private val realByWeakKey = linkedMapOf<String, TripEvaluationSnapshot>()
-    private val previewByWeakKey = linkedMapOf<String, TripEvaluationSnapshot>()
+    private val realByStrongKey = ConcurrentHashMap<String, TripEvaluationSnapshot>()
+    private val realByWeakKey = ConcurrentHashMap<String, TripEvaluationSnapshot>()
+    private val previewByWeakKey = ConcurrentHashMap<String, TripEvaluationSnapshot>()
 
     fun store(snapshot: TripEvaluationSnapshot) {
         prune(snapshot.updatedAtMs)
@@ -57,7 +58,7 @@ class TripEvaluationCache(
         return removed
     }
 
-    private fun MutableMap<String, TripEvaluationSnapshot>.removeExpired(nowMs: Long): Int {
+    private fun ConcurrentHashMap<String, TripEvaluationSnapshot>.removeExpired(nowMs: Long): Int {
         val expiredKeys = entries
             .filter { nowMs - it.value.updatedAtMs > ttlMs }
             .map { it.key }

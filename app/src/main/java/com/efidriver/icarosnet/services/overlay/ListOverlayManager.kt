@@ -75,6 +75,13 @@ class ListOverlayManager(
             return false
         }
 
+        // Diagnóstico de coordenadas fuera de pantalla (Culling Test)
+        val displayMetrics = context.resources.displayMetrics
+        val screenHeight = displayMetrics.heightPixels
+        if ((bounds.top > screenHeight) || (bounds.bottom < 0)) {
+            Log.i("EfiDiagnostic", "OFFSCREEN_ROW_SYNC_DETECTED key=$tripKey y=${bounds.top}..${bounds.bottom} screenH=$screenHeight")
+        }
+
         val overlayWidth = (bounds.width() * 0.4).toInt()
         val params = WindowManager.LayoutParams(
             overlayWidth,
@@ -94,9 +101,14 @@ class ListOverlayManager(
         return try {
             if (activeOverlays.containsKey(tripKey)) {
                 val record = activeOverlays.getValue(tripKey)
+                
                 updateHUDText(record.textContainer, result)
                 applyBackground(record.view, result)
                 if (record.lastBounds != bounds) {
+                    val deltaY = kotlin.math.abs(record.lastBounds.top - bounds.top)
+                    if (deltaY > 50) {
+                        Log.i("EfiDiagnostic", "HIGH_DISPLACEMENT key=$tripKey deltaY=$deltaY")
+                    }
                     record.lastBounds = Rect(bounds)
                     windowManager.updateViewLayout(record.view, params)
                     lifecycleMonitor.markOverlayUpdated(tripKey, result, "layout_changed", isVerbose())
