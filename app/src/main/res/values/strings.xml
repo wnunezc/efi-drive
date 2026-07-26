@@ -1,4 +1,0 @@
-<resources>
-    <string name="app_name">efi-driver</string>
-    <string name="accessibility_service_description">Permite a efi-driver analizar la pantalla para calcular eficiencia y optimizar rutas.</string>
-</resources>
