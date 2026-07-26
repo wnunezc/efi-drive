@@ -1,10 +1,7 @@
-# EfiDriver - Gitignore para rama Master (Distribución)
-*
-!releases/
-!README.md
-!ARCHITECTURE_ANALYSIS.md
-!AGENTS.md
-!BEHAVIORAL_BUG_REPORT.md
-!PROJECT_STUDY.md
-!TECHNICAL_DEBT.md
-!.gitignore
+# Gitignore para rama Master (Solo distribución)
+.idea/
+.gradle/
+build/
+local.properties
+*.jks
+*.keystore
