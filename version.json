@@ -1,6 +1,6 @@
 {
-  "version": "0.0.1",
-  "versionCode": 1,
-  "downloadUrl": "https://github.com/wnunezc/efi-drive/raw/master/releases/efi-driver-v0.0.1-alpha.apk",
-  "releaseNotes": "Versión 0.0.1-Alpha (Oficial): Sistema de notificaciones nativas, alertas de licencia y motor de visión 2D refinado."
+  "version": "0.0.2",
+  "versionCode": 2,
+  "downloadUrl": "https://github.com/wnunezc/efi-drive/raw/master/releases/efi-driver-v0.0.2-alpha.apk",
+  "releaseNotes": "Versión 0.0.2-Alpha (Estable): Parche de seguridad SSL para licencias y optimización del motor de notificaciones."
 }
