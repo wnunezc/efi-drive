@@ -1,6 +1,6 @@
 {
-  "version": "0.0.3",
-  "versionCode": 3,
-  "downloadUrl": "https://github.com/wnunezc/efi-drive/raw/master/releases/efi-driver-v0.0.3-alpha.apk",
-  "releaseNotes": "Versión 0.0.3-Alpha (Definitiva): Instalación forzada de certificados CA por código para compatibilidad total con dispositivos Tecno Spark y otros modelos."
+  "version": "0.0.4",
+  "versionCode": 4,
+  "downloadUrl": "https://github.com/wnunezc/efi-drive/raw/master/releases/efi-driver-v0.0.4-alpha.apk",
+  "releaseNotes": "Versión 0.0.4-Alpha (Estable): Gesto de Rescate para oclusiones de mapa, Watchdog de 4 segundos para cierre de bucles y sistema de diagnóstico Caja Negra."
 }
