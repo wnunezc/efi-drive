@@ -1,6 +1,6 @@
 {
-  "version": "0.0.4",
-  "versionCode": 4,
-  "downloadUrl": "https://github.com/wnunezc/efi-drive/raw/master/releases/efi-driver-v0.0.4-alpha.apk",
-  "releaseNotes": "Versión 0.0.4-Alpha (Estable): Gesto de Rescate para oclusiones de mapa, Watchdog de 4 segundos para cierre de bucles y sistema de diagnóstico Caja Negra."
+  "version": "0.0.5",
+  "versionCode": 5,
+  "downloadUrl": "https://github.com/wnunezc/efi-drive/raw/master/releases/efi-driver-v0.0.5-alpha.apk",
+  "releaseNotes": "Versión 0.0.5-Alpha (Estable): Optimizaciones en el motor de visión y mejoras en la estabilidad del flujo de detalle."
 }
