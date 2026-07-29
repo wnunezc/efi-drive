@@ -1,6 +1,6 @@
 {
-  "version": "0.0.6",
-  "versionCode": 6,
-  "downloadUrl": "https://github.com/wnunezc/efi-drive/raw/master/releases/efi-driver-v0.0.6-alpha.apk",
-  "releaseNotes": "Versión 0.0.6-Alpha: Mejoras en la estabilidad del motor y correcciones en la lógica de soporte."
+  "version": "0.0.7",
+  "versionCode": 7,
+  "downloadUrl": "https://github.com/wnunezc/efi-drive/raw/master/releases/efi-driver-v0.0.7-alpha.apk",
+  "releaseNotes": "Versión 0.0.7-Alpha: Estabilidad crítica y optimización del motor de respuesta."
 }
