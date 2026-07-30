@@ -1,7 +1,30 @@
-# Gitignore para rama Master (Solo distribución)
+# Build artifacts
+.gradle
+/build
+/app/build
+/captures
+
+# IDE files
 .idea/
-.gradle/
-build/
+*.iml
+*.ipr
+*.iws
+.kotlin/
+
+# Local configuration
 local.properties
+.DS_Store
+
+# Signing and credentials
 *.jks
 *.keystore
+
+# Diagnostic reports (Local only)
+temp_report/
+ameth.png
+gilberto.png
+luzelena.png
+samir.png
+yanicelys.png
+fail_roi_*.png
+view.xml
