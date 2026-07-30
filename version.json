@@ -1,6 +1,6 @@
 {
-  "version": "0.0.8",
-  "versionCode": 8,
-  "downloadUrl": "https://github.com/wnunezc/efi-drive/raw/master/releases/efi-driver-v0.0.8-alpha.apk",
-  "releaseNotes": "Versión 0.0.8-Alpha: Optimizaciones de rendimiento y correcciones menores en la interfaz de usuario."
+  "version": "0.0.9",
+  "versionCode": 9,
+  "downloadUrl": "https://github.com/wnunezc/efi-drive/raw/master/releases/efi-driver-v0.0.9-alpha.apk",
+  "releaseNotes": "Versión 0.0.9-Alpha: Estabilización del flujo de cambio de ramas y optimización de infraestructura de Git."
 }
